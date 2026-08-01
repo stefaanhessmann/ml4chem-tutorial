@@ -740,6 +740,20 @@ def _(mo):
     `model(x, t, cond)` the sampler expects, binding everything except the
     positions. The neighbor list is static: atoms move at every step, but the
     cutoff function handles the changing distances, so nothing is rebuilt.
+
+    A third, `recording_model_fn`, is what makes the viewer below a **movie**
+    rather than a still. A sampler returns the structure it ended on and
+    nothing else — but every step passes its state through the model, so
+    wrapping the model captures the whole run without the sampler knowing.
+    Scrub the slider: the cloud collapses within the first two or three model
+    calls, and everything after that is the structure being tidied up. The
+    panel on the right is the frame it finishes on.
+
+    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 30$ Å, so
+    the starting cloud is ~80 Å across against a ~3 Å molecule — a 25× range no
+    single camera can hold. The view is framed on the finished structure and
+    pulled back (`zoom=0.35`), so the earliest frames spill past the edges and
+    the atoms fly in from outside. That gap *is* the scale the model closes.
     """)
     return
 
@@ -756,7 +770,7 @@ def _(
     torch,
     viz,
 ):
-    from helpers import fully_connected_batch, make_model_fn
+    from helpers import fully_connected_batch, make_model_fn, recording_model_fn
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
@@ -770,10 +784,24 @@ def _(
     # centered on its own — then run the denoising loop
     n_total = int(sampling_batch[properties.n_atoms].sum())
     x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
-    with torch.no_grad():
-        x_direct = direct.denoise(model_fn, x_init, n_steps=15)
 
-    viz.show_batch({**sampling_batch, properties.R: x_direct}, cell_px=170)
+    # the sampler returns the final structure only; wrapping the model keeps
+    # every state it was asked about, which is the trajectory
+    watched_fn, direct_frames = recording_model_fn(model_fn)
+    with torch.no_grad():
+        x_direct = direct.denoise(watched_fn, x_init, n_steps=15)
+    direct_frames.append(x_direct)  # ...plus the structure it ended on
+
+    # zoom < 1 pulls the camera back: it frames the final molecule, and the
+    # first frames are a 90 Å-wide cloud that should not fly off the panel
+    viz.show_trajectory(
+        direct_frames,
+        sampling_batch,
+        end=True,
+        panel_labels=("", "denoising", "sample x̂₀"),
+        zoom=0.35,
+        cell_px=170,
+    )
     return model_fn, n_total, sampling_batch, x_direct
 
 
@@ -812,6 +840,14 @@ def _(mo):
     expensive of the two, which is precisely the pressure that produced methods
     like GPFF's. Both are `schnetpack.generative` one-liners over the same
     trained model, so swapping them is a one-line experiment.
+
+    Watch the difference in the movie. Direct denoising is at molecular size
+    after two or three calls and spends everything after that refining; the
+    ladder comes down *gradually* — still ~11 Å across a quarter of the way in,
+    where direct denoising was already at 3 — and only settles near the bottom,
+    where the rungs are close together. Same model, same starting noise: the
+    schedule is the only thing that differs. The frames carry the grid's own
+    times, so the caption reads out the rung each one sits on, $t = 1$ to $0$.
     """)
     return
 
@@ -828,24 +864,42 @@ def _(
     torch,
     viz,
 ):
+    from helpers import recording_model_fn as _rec
     from schnetpack.generative import Sampler
     from schnetpack.generative.integrators import Ancestral
+
+    N_LADDER = 64
 
     torch.manual_seed(2)
     # process + parametrization as before, plus the two sampling-only parts;
     # `grid` is left at its default (uniform in t = geometric in sigma on VE)
     ancestral = Sampler(big_process, force_param, integrator=Ancestral())
 
+    watched_anc, ancestral_frames = _rec(model_fn)
     with torch.no_grad():
         x_ancestral = ancestral.sample(
-            model_fn,
+            watched_anc,
             shape=(n_total, 3),
-            n_steps=64,
+            n_steps=N_LADDER,
             context=sampling_batch,  # same per-molecule centering as above
             device=DEVICE,
         )
+    ancestral_frames.append(x_ancestral)
 
-    viz.show_batch({**sampling_batch, properties.R: x_ancestral}, cell_px=170)
+    # this sampler *does* have a time grid, so the frames can be captioned with
+    # it: the rungs the ladder actually stepped through, t = 1 down to t = 0
+    ladder_t = ancestral.grid(ancestral.t_max, ancestral.t_min, N_LADDER)
+
+    viz.show_trajectory(
+        ancestral_frames,
+        sampling_batch,
+        times=ladder_t.tolist(),
+        end=True,
+        panel_labels=("", "walking the ladder", "sample x̂₀"),
+        zoom=0.35,
+        cell_px=170,
+        frame_ms=120,  # 65 frames — play them faster than the default
+    )
     return (x_ancestral,)
 
 
@@ -1126,7 +1180,14 @@ def _(
         )
         ax.grid(alpha=0.3, which="both")
         # one animated box per molecule; the σ̂ story is the plot above
-        viewer = viz.show_trajectory(vcd.frames, sampling_batch, cell_px=170)
+        viewer = viz.show_trajectory(
+            vcd.frames,
+            sampling_batch,
+            end=True,
+            panel_labels=("", "self-paced descent", "sample x̂₀"),
+            zoom=0.35,
+            cell_px=170,
+        )
         return fig, viewer
 
     viz.details("🔑 Reference solution — try it yourself first!", *solution_view())

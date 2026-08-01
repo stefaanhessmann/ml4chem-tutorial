@@ -14,6 +14,7 @@ from schnetpack import properties
 __all__ = [
     "fully_connected_batch",
     "make_model_fn",
+    "recording_model_fn",
     "to_device",
 ]
 
@@ -65,3 +66,25 @@ def make_model_fn(model, static_batch, output_key):
         return model(inputs)[output_key]
 
     return model_fn
+
+
+def recording_model_fn(model_fn):
+    """Wrap ``model_fn`` so every state it is asked about is kept.
+
+    A sampler hands back the structure it ended on and nothing else — the
+    frames along the way are not its to return. They do not have to be: every
+    step passes its current state through the model, so wrapping the *model*
+    records the trajectory without the sampler knowing. That is why this works
+    for any of them, the one you write in section 8 included.
+
+    Returns ``(wrapped, frames)``. ``frames`` fills as sampling runs and ends
+    one short — the last state the model saw is not the last state of the run —
+    so append the sampler's return value to finish the trajectory.
+    """
+    frames = []
+
+    def wrapped(x, t, cond=None):
+        frames.append(x.detach().clone())
+        return model_fn(x, t, cond)
+
+    return wrapped, frames
