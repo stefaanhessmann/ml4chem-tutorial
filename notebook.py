@@ -430,23 +430,20 @@ def _(
         sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, coupling=PermutationCoupling()
     )
 
-    train_loader = AtomsLoader(
-        ASEAtomsData(
-            DB_PATH,
-            load_properties=[],
-            transforms=[
-                trn.SubtractCenterOfGeometry(),
-                Diffuse(
-                    gpff_process, force_param, label_key="pseudo_force", time_key="t"
-                ),
-                trn.MatScipyNeighborList(cutoff=CUTOFF),
-                trn.CastTo32(),
-            ],
-        ),
-        batch_size=10,
-        shuffle=True,
+    diffused = ASEAtomsData(
+        DB_PATH,
+        load_properties=[],
+        transforms=[
+            trn.SubtractCenterOfGeometry(),
+            Diffuse(gpff_process, force_param, label_key="pseudo_force", time_key="t"),
+            trn.MatScipyNeighborList(cutoff=CUTOFF),
+            trn.CastTo32(),
+        ],
     )
-    peek = next(iter(train_loader))
+    train_loader = AtomsLoader(diffused, batch_size=100, shuffle=True)
+    # a second, smaller draw from the same pipeline — only so the picture below
+    # stays a picture; a hundred viewers on one page is not one
+    peek = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
     {key: tuple(peek[key].shape) for key in ("_positions", "pseudo_force", "t")}
     return CUTOFF, gpff_process, peek, train_loader
 
@@ -454,8 +451,8 @@ def _(
 @app.cell
 def _(mo):
     mo.md(r"""
-    That batch *is* the training set of our generative model — so look at it.
-    Below, the structures the dataloader just handed us: each at its own
+    Those batches *are* the training set of our generative model — so look at
+    one. Below, ten structures drawn from the same loader: each at its own
     randomly drawn time, captioned with its noise level, with the
     **pseudo-force label drawn as an arrow on every atom**.
 
@@ -564,7 +561,9 @@ def _(mo):
     rather than learning the denoising field.
 
     A trained checkpoint ships with the tutorial and is loaded by default; set
-    `RETRAIN = True` to train from scratch (~20 min on CPU). Don't over-read
+    `RETRAIN = True` to train from scratch — roughly 4 minutes on a GPU against
+    40 on a CPU, which is the one place in this notebook the hardware
+    genuinely matters. Don't over-read
     the loss curve: it plateaus at a high-looking value because the deepest
     noise levels keep a large irreducible error — that is healthy.
     """)
@@ -574,6 +573,7 @@ def _(mo):
 @app.cell
 def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
     import matplotlib.pyplot as plt
+    from tqdm.auto import tqdm
 
     from helpers import to_device
 
@@ -592,9 +592,19 @@ def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
         gpff_net.load_state_dict(ckpt_state["state_dict"])
         history = [tuple(h) for h in ckpt_state["history"]]
     else:
-        optimizer = torch.optim.Adam(gpff_net.parameters(), lr=5e-4)
+        EPOCHS, LR_START, LR_END = 500, 5e-4, 1e-5
+        optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
+        # decay the step size geometrically from LR_START to LR_END across the
+        # run — one factor per epoch, so the last epochs only polish
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=(LR_END / LR_START) ** (1 / EPOCHS)
+        )
         history, step = [], 0
-        for epoch in range(260):  # 181 molecules / batch 10 → ~5000 steps
+        # the bar counts epochs; its postfix is that epoch's mean loss, the same
+        # number the curve below plots
+        epochs = tqdm(range(EPOCHS), desc="epoch", unit="ep")
+        for epoch in epochs:
+            running = 0.0
             for train_batch in train_loader:  # fresh (t, noise) draws every epoch
                 step += 1
                 train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
@@ -602,8 +612,13 @@ def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if step == 1 or step % 100 == 0:
-                    history.append((step, loss.item()))
+                running += loss.item()
+                history.append((step, loss.item()))
+            scheduler.step()
+            epochs.set_postfix(
+                loss=f"{running / len(train_loader):.4f}",
+                lr=f"{scheduler.get_last_lr()[0]:.1e}",
+            )
         torch.save({"state_dict": gpff_net.state_dict(), "history": history}, CKPT)
 
     gpff_model = gpff_net.eval()  # downstream cells use the *trained* model
