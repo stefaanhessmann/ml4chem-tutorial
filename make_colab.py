@@ -88,9 +88,12 @@ def build_wheel(checkout: Path) -> str:
 
 
 def setup_cell(repo: str, pin: str, wheel: str = None) -> dict:
-    # Absolute paths and a guard, so re-running the cell — which students do,
-    # usually after the runtime has recycled — is a no-op rather than a nested
-    # checkout or a clone that fails on an existing directory.
+    # Absolute paths throughout, so re-running the cell — which students do,
+    # usually after the runtime has recycled — never nests a checkout inside a
+    # checkout. An existing directory is *refreshed*, not skipped: the notebook
+    # is fetched from GitHub every time it is opened, the checkout beside it is
+    # not, so a runtime warm from before a push would otherwise run new cells
+    # against old helpers.py — an ImportError deep in §7, far from its cause.
     # rdkit rides along: Colab images don't ship it, and §7's validity check needs it
     install = (
         f"!pip install -q rdkit /content/tutorial/{wheel}"
@@ -98,14 +101,25 @@ def setup_cell(repo: str, pin: str, wheel: str = None) -> dict:
         else '!pip install -q rdkit "git+https://github.com/'
         f'atomistic-machine-learning/schnetpack.git@{pin}"'
     )
+    # Every build carries the same version string, so pip counts an updated
+    # wheel as already satisfied and keeps the stale one. Force this one file.
+    refresh = (
+        f"\n!pip install -q --force-reinstall --no-deps /content/tutorial/{wheel}"
+        if wheel
+        else ""
+    )
     src = f"""\
 # Fetch SchNetPack and the tutorial files into this runtime. Run me first.
+# Safe to re-run: it refreshes what is already here rather than duplicating it.
 import os
 
-if not os.path.isdir("/content/tutorial"):
+if os.path.isdir("/content/tutorial"):
+    !git -C /content/tutorial fetch -q --depth 1 origin HEAD
+    !git -C /content/tutorial reset -q --hard FETCH_HEAD
+else:
     !git clone -q --depth 1 {repo} /content/tutorial
 %cd /content/tutorial
-{install}
+{install}{refresh}
 
 import schnetpack
 print("schnetpack", schnetpack.__version__, "ready")\
