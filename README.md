@@ -47,7 +47,7 @@ Python ≥ 3.12 (what SchNetPack requires); everything runs on CPU:
 conda create -n ml4chem python=3.12
 conda activate ml4chem
 pip install "git+https://github.com/atomistic-machine-learning/schnetpack.git@sh/v3"
-pip install marimo matplotlib scipy
+pip install marimo matplotlib scipy rdkit
 ```
 
 ## Run

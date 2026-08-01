@@ -91,10 +91,11 @@ def setup_cell(repo: str, pin: str, wheel: str = None) -> dict:
     # Absolute paths and a guard, so re-running the cell — which students do,
     # usually after the runtime has recycled — is a no-op rather than a nested
     # checkout or a clone that fails on an existing directory.
+    # rdkit rides along: Colab images don't ship it, and §7's validity check needs it
     install = (
-        f"!pip install -q /content/tutorial/{wheel}"
+        f"!pip install -q rdkit /content/tutorial/{wheel}"
         if wheel
-        else '!pip install -q "git+https://github.com/'
+        else '!pip install -q rdkit "git+https://github.com/'
         f'atomistic-machine-learning/schnetpack.git@{pin}"'
     )
     src = f"""\

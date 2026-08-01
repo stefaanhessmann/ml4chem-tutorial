@@ -55,7 +55,7 @@ def _(mo):
     conda create -n ml4chem python=3.12
     conda activate ml4chem
     pip install "git+https://github.com/atomistic-machine-learning/schnetpack.git@sh/v3"
-    pip install marimo matplotlib scipy
+    pip install marimo matplotlib scipy rdkit
     marimo edit notebook.py
     ```
 
@@ -743,6 +743,74 @@ def _(batch, properties, sampling_batch, torch, x_sampled):
     {
         "dataset (reference)": geometry_summary(batch[properties.R], batch),
         "generated (8 samples)": geometry_summary(x_sampled, sampling_batch),
+    }
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### From geometry to chemistry
+
+    Distance checks ask whether the geometry is *sane* — they never ask
+    whether it is a *molecule*. RDKit can: `rdDetermineBonds` infers a bond
+    graph from nothing but the coordinates, and the structure counts as
+    **chemically valid** only if that graph works out — every valence
+    satisfied as a neutral molecule, no unpaired electrons left over, and
+    everything in one connected piece. A structure that passes earns a
+    **SMILES** string: the molecule's identity, independent of coordinates.
+
+    That string is what makes this more than a stricter filter. The *valid
+    fraction* is the standard headline metric for molecular generative
+    models, and SMILES says *which* molecule each sample is — compare them
+    against the dataset's to see whether the model reproduced a training
+    isomer or found a new one. The dataset batch calibrates the check once
+    more: relaxed QM9 structures pass it. It is a *strict* judge — a single
+    fused pair already sinks a sample — so don't be surprised if our small
+    model passes few of its eight, or none. Watching this number climb is
+    how you would know a bigger model or a better sampler actually helped.
+    """)
+    return
+
+
+@app.cell
+def _(batch, properties, sampling_batch, x_sampled):
+    from ase.data import chemical_symbols
+    from rdkit import Chem
+    from rdkit.Chem import rdDetermineBonds
+    from rdkit.rdBase import BlockLogs
+
+    def rdkit_verdict(Z, pos):
+        """(valid, smiles) for one structure, bonds inferred from coordinates."""
+        xyz = [str(len(Z)), ""] + [
+            f"{chemical_symbols[int(z)]} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}"
+            for z, p in zip(Z.tolist(), pos.tolist())
+        ]
+        try:
+            with BlockLogs():  # silence RDKit's complaints about broken samples
+                mol = Chem.MolFromXYZBlock("\n".join(xyz))
+                rdDetermineBonds.DetermineBonds(
+                    mol, charge=0, allowChargedFragments=False, embedChiral=True
+                )
+                if any(a.GetNumRadicalElectrons() for a in mol.GetAtoms()):
+                    return False, ""
+                smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
+                return smiles != "" and "." not in smiles, smiles
+        except Exception:  # no consistent bond graph exists for these positions
+            return False, ""
+
+    def chemistry_summary(x, layout):
+        idx_m = layout[properties.idx_m]
+        verdicts = [
+            rdkit_verdict(layout[properties.Z][idx_m == m], x[idx_m == m])
+            for m in range(int(layout[properties.n_atoms].shape[0]))
+        ]
+        valid = [s for ok, s in verdicts if ok]
+        return {"valid": f"{len(valid)}/{len(verdicts)}", "SMILES": sorted(valid)}
+
+    {
+        "dataset (reference)": chemistry_summary(batch[properties.R], batch),
+        "generated (8 samples)": chemistry_summary(x_sampled, sampling_batch),
     }
     return
 
