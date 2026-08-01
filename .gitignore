@@ -2,10 +2,13 @@
 # shipped xyz on first run, and watching that happen is the point.
 data/*.db
 
-# Checkpoints are large and mostly experimental. Ship exactly the one the
+# Checkpoints are large and mostly experimental. Ship exactly the ones the
 # tutorial loads — adding another is one line here, deliberately.
 checkpoints/*
 !checkpoints/gpff.pt
+# 20 MB, and the reason §7-8 generate real molecules where the small model
+# above cannot. Converted from the GPFF QM9 run by convert_gpff_seed999.py.
+!checkpoints/gpff_big.pt
 
 # Development scripts: they stay on disk, they do not go to students.
 convert_gpff_seed999.py

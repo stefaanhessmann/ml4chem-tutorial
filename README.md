@@ -11,8 +11,9 @@ starts — your own data in an ASE database, transforms, batches — and then
 builds a generative model out of the same pieces a machine-learned force field
 is made of: noising structures and computing labels as a dataloader transform
 (`Diffuse`), a `NeuralNetworkPotential` with a per-atom vector head, a plain
-PyTorch training loop, and direct denoising to generate new structures. Ends
-with a hands-on task: a variance-conditioned direct-denoising sampler.
+PyTorch training loop, and two samplers — direct denoising and ancestral
+sampling — to generate new structures. Ends with a hands-on task: a
+variance-conditioned direct-denoising sampler.
 
 The model is **GPFF** (Gaussian pseudo-force field), whose target is a pseudo
 force — which makes it, structurally, an ordinary force field applied to noised
@@ -26,13 +27,15 @@ ML4Chem-tutorial/
 ├── data/
 │   └── qm9_c4h4n2o2.xyz   ← 181 QM9 isomers of C4H4N2O2, with U0 energies [eV]
 ├── checkpoints/
-│   └── gpff.pt            ← trained GPFF model (sections 6-8)
+│   ├── gpff.pt            ← the small GPFF section 6 trains (48k params, this dataset)
+│   └── gpff_big.pt        ← GPFF trained on all of QM9 (5.1M params); sections 7-8
+│                            sample with this — the small one cannot generate
 ├── viz.py                 ← 3D trajectory viewer (3Dmol.js grid, shared slider,
 │                            optional per-atom vector arrows)
 ├── helpers.py             ← notebook glue: static sampling batches and the
 │                            batch-dict → model(x, t) adapter
 ├── assets/3Dmol-min.js    ← vendored viewer library (offline, no CDN)
-├── make_checkpoints.py    ← regenerates the checkpoint (~20 min on CPU)
+├── make_checkpoints.py    ← regenerates gpff.pt (~20 min on CPU)
 └── make_colab.py          ← derives notebook.ipynb for Colab (see below)
 ```
 
@@ -59,8 +62,16 @@ marimo edit notebook.py     # interactive (recommended for the tutorial)
 marimo run notebook.py      # read-only app view
 ```
 
-The training cell loads the shipped checkpoint by default; set `RETRAIN = True`
+The training cell loads the shipped `gpff.pt` by default; set `RETRAIN = True`
 there (or run `python make_checkpoints.py`) to train from scratch.
+
+**Two models, deliberately.** Section 6 trains a teaching-sized network — small
+enough to train live, too small to generate: on this dataset it fuses atoms in
+most of its samples and passes the RDKit validity check essentially never.
+Sections 7-8 therefore load `gpff_big.pt`, the same GPFF target and process at
+research scale (5.1M parameters, all of QM9, σ_max = 30 Å), which samples clean
+geometry. It is not produced by `make_checkpoints.py`: it is converted from the
+GPFF QM9 training run by `convert_gpff_seed999.py` (a dev script, not shipped).
 
 ## Colab
 

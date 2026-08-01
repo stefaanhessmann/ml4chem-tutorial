@@ -29,7 +29,7 @@ def _(mo):
     4. **Generative models in SchNetPack** — the roadmap
     5. **Data augmentation** — noising structures, defining labels
     6. **Model architecture and training** — a force field on noised structures
-    7. **Sampling** — direct denoising, and checking what we made
+    7. **Sampling** — direct denoising, ancestral sampling, and checking what we made
     8. **Your task** — a variance-conditioned sampler
 
     ## 1. Setup
@@ -42,7 +42,8 @@ def _(mo):
     ├── data/
     │   └── qm9_c4h4n2o2.xyz   ← the dataset: 181 small molecules from QM9
     ├── checkpoints/
-    │   └── gpff.pt            ← a trained model — nothing has to train today
+    │   ├── gpff.pt            ← the small model §6 trains — ships, so nothing has to train
+    │   └── gpff_big.pt        ← a GPFF trained on all of QM9; §7-8 generate with this one
     ├── helpers.py             ← small glue code (batch adapters for sampling)
     ├── viz.py                 ← 3D molecule viewer
     └── assets/3Dmol-min.js    ← vendored viewer library (works offline)
@@ -538,7 +539,14 @@ def _(CUTOFF, DEVICE, torch):
         ],
     ).to(DEVICE)
     f"GPFF model: {sum(p.numel() for p in gpff_net.parameters()):,} parameters on {DEVICE}"
-    return gpff_net, snn
+    return (
+        AtomwiseVector,
+        NeuralNetworkPotential,
+        PaiNN,
+        PairwiseDistances,
+        gpff_net,
+        snn,
+    )
 
 
 @app.cell
@@ -637,6 +645,80 @@ def _(mo):
     mo.md(r"""
     ## 7. Sampling
 
+    ### First, a model that can generate
+
+    The model §6 trained is a **teaching-sized** one: ~48k parameters, 181
+    structures, four minutes. That is enough to watch the loss fall and to see
+    the pieces fit together — but not enough to *generate*. Denoising has to be
+    accurate exactly where geometry is decided, at $\sigma \lesssim 0.3$ Å where
+    bond lengths live, and a model that small trained on that little data places
+    atoms on top of each other. You would see it immediately in the validation
+    numbers below: essentially none of its samples survive the chemistry check.
+
+    So sampling switches models. `checkpoints/gpff_big.pt` is a GPFF trained the
+    same way — same pseudo-force target, same VE process — but at research
+    scale: **5.1M parameters, trained on all ~130k molecules of QM9**. Nothing
+    conceptual changes, and the assembly below is the same
+    `NeuralNetworkPotential` of §6 with bigger numbers in it. Two settings do
+    differ, and both are properties of *that* training run rather than choices
+    we are free to make here: it was trained at $\sigma_\text{max} = 30$ Å
+    (against our 10), so it needs its own `VE`, and its cutoff is 150 Å.
+
+    Everything from here on — both samplers and your task in §8 — runs on this
+    model. If you want to see what your own §6 model does instead, one name
+    changes: `make_model_fn(gpff_model, ...)` below.
+    """)
+    return
+
+
+@app.cell
+def _(
+    AtomwiseVector,
+    DEVICE,
+    HERE,
+    NeuralNetworkPotential,
+    PaiNN,
+    PairwiseDistances,
+    VE,
+    os,
+    snn,
+    torch,
+):
+    BIG_CUTOFF, BIG_SIGMA_MAX, BIG_SIGMA_MIN = 150.0, 30.0, 0.01
+
+    big_net = NeuralNetworkPotential(
+        representation=PaiNN(
+            n_atom_basis=256,
+            n_interactions=4,
+            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=BIG_CUTOFF),
+            cutoff_fn=snn.CosineCutoff(BIG_CUTOFF),
+            norm_epsilon=1.0,  # this run normalized pair directions as r / (d + 1)
+        ),
+        input_modules=[PairwiseDistances()],
+        output_modules=[
+            AtomwiseVector(n_in=256, n_layers=3, output_key="pseudo_force_pred")
+        ],
+    ).to(DEVICE)
+    big_net.load_state_dict(
+        torch.load(
+            os.path.join(HERE, "checkpoints", "gpff_big.pt"),
+            weights_only=True,
+            map_location=DEVICE,
+        )["state_dict"]
+    )
+    big_model = big_net.eval()
+
+    # its own process: this model was trained at sigma_max = 30 A, so the §5
+    # schedule (10 A) is not the one its predictions are calibrated against
+    big_process = VE(sigma_min=BIG_SIGMA_MIN, sigma_max=BIG_SIGMA_MAX)
+
+    f"generation model: {sum(p.numel() for p in big_net.parameters()):,} parameters on {DEVICE}, σ_max = {BIG_SIGMA_MAX:g} Å"
+    return big_model, big_process
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ### Direct denoising
 
     The pseudo force is the way home in one step: $\hat x_0 = x + F/2$. Taken
@@ -665,9 +747,9 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
+    big_model,
+    big_process,
     force_param,
-    gpff_model,
-    gpff_process,
     numbers,
     properties,
     to_device,
@@ -680,19 +762,91 @@ def _(
     torch.manual_seed(2)
     # 8 molecules-to-be, laid out where the model lives
     sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
-    model_fn = make_model_fn(gpff_model, sampling_batch, "pseudo_force_pred")
+    model_fn = make_model_fn(big_model, sampling_batch, "pseudo_force_pred")
 
-    direct = DirectDenoisingSampler(gpff_process, force_param, stochastic_lambda=1.0)
+    direct = DirectDenoisingSampler(big_process, force_param, stochastic_lambda=1.0)
 
     # draw the start with the batch layout as context — each molecule's cloud
     # centered on its own — then run the denoising loop
     n_total = int(sampling_batch[properties.n_atoms].sum())
     x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
     with torch.no_grad():
-        x_sampled = direct.denoise(model_fn, x_init, n_steps=15)
+        x_direct = direct.denoise(model_fn, x_init, n_steps=15)
 
-    viz.show_batch({**sampling_batch, properties.R: x_sampled}, cell_px=170)
-    return model_fn, sampling_batch, x_sampled
+    viz.show_batch({**sampling_batch, properties.R: x_direct}, cell_px=170)
+    return model_fn, n_total, sampling_batch, x_direct
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Ancestral sampling
+
+    Direct denoising is GPFF's own sampler, and it is unusual: no schedule, no
+    time grid, nothing that tracks how noisy the iterate is. The **classical**
+    route does the opposite — it walks a *prescribed* ladder of noise levels
+    $\sigma_N > \sigma_{N-1} > \dots > \sigma_0$ and takes one exact step down
+    each rung. This is the reverse process of the lecture, and it is what every
+    time-conditioned diffusion model uses.
+
+    SchNetPack assembles that from four parts, which is the same decomposition
+    as §5's — process and parametrization, plus two that only sampling needs:
+
+    | part | what it decides | here |
+    |---|---|---|
+    | `process` | the noise schedule $\sigma(t)$ | the model's `VE` |
+    | `parametrization` | what the network's output means | pseudo force |
+    | `integrator` | how one step down the ladder is taken | `Ancestral` |
+    | `grid` | where the rungs sit | uniform in $t$ (the default) |
+
+    `Ancestral` takes the exact step: it converts the prediction into an
+    estimate $\hat x_0$, then draws from the closed-form Gaussian for
+    $x_{\sigma_{k-1}}$ given $x_{\sigma_k}$ and $\hat x_0$ — no approximation
+    beyond the model's own error. On a VE process that reduces to the familiar
+    score-form update. And because VE's $\sigma$ grows *geometrically* in $t$,
+    a uniform grid already gives the geometric ladder score matching wants; no
+    schedule code is needed.
+
+    Compare the two samplers on cost. Direct denoising above took **15** model
+    calls; the ladder below takes **64** — schedule-based sampling is the more
+    expensive of the two, which is precisely the pressure that produced methods
+    like GPFF's. Both are `schnetpack.generative` one-liners over the same
+    trained model, so swapping them is a one-line experiment.
+    """)
+    return
+
+
+@app.cell
+def _(
+    DEVICE,
+    big_process,
+    force_param,
+    model_fn,
+    n_total,
+    properties,
+    sampling_batch,
+    torch,
+    viz,
+):
+    from schnetpack.generative import Sampler
+    from schnetpack.generative.integrators import Ancestral
+
+    torch.manual_seed(2)
+    # process + parametrization as before, plus the two sampling-only parts;
+    # `grid` is left at its default (uniform in t = geometric in sigma on VE)
+    ancestral = Sampler(big_process, force_param, integrator=Ancestral())
+
+    with torch.no_grad():
+        x_ancestral = ancestral.sample(
+            model_fn,
+            shape=(n_total, 3),
+            n_steps=64,
+            context=sampling_batch,  # same per-molecule centering as above
+            device=DEVICE,
+        )
+
+    viz.show_batch({**sampling_batch, properties.R: x_ancestral}, cell_px=170)
+    return (x_ancestral,)
 
 
 @app.cell
@@ -708,16 +862,17 @@ def _(mo):
     dataset batch calibrates them: real bond lengths here are ~1.0–1.5 Å, and
     the dataset scores zero on both counts by construction.
 
-    Our model is small (~48k parameters) and saw 181 structures, so don't
-    expect perfection — some samples come out with atoms fused together. Being
-    able to say *how many* is the point: that number is what tells you whether
-    a change to the model, the process or the sampler actually helped.
+    Both samplers are scored, against the dataset row. Being able to say *how
+    many* is the point: that number is what tells you whether a change to the
+    model, the process or the sampler actually helped — and it is what says the
+    §6-sized model was not up to this, since it fuses atoms in most of its
+    samples where the generation model fuses none.
     """)
     return
 
 
 @app.cell
-def _(batch, properties, sampling_batch, torch, x_sampled):
+def _(batch, properties, sampling_batch, torch, x_ancestral, x_direct):
     def geometry_checks(x, layout):
         """Nearest-neighbor distances per molecule: min = closest pair, max = loneliest atom."""
         rows = []
@@ -742,7 +897,8 @@ def _(batch, properties, sampling_batch, torch, x_sampled):
 
     {
         "dataset (reference)": geometry_summary(batch[properties.R], batch),
-        "generated (8 samples)": geometry_summary(x_sampled, sampling_batch),
+        "direct denoising (8)": geometry_summary(x_direct, sampling_batch),
+        "ancestral (8)": geometry_summary(x_ancestral, sampling_batch),
     }
     return
 
@@ -765,16 +921,19 @@ def _(mo):
     models, and SMILES says *which* molecule each sample is — compare them
     against the dataset's to see whether the model reproduced a training
     isomer or found a new one. The dataset batch calibrates the check once
-    more: relaxed QM9 structures pass it. It is a *strict* judge — a single
-    fused pair already sinks a sample — so don't be surprised if our small
-    model passes few of its eight, or none. Watching this number climb is
-    how you would know a bigger model or a better sampler actually helped.
+    more: relaxed QM9 structures pass it.
+
+    It is a *strict* judge — a single fused pair already sinks a sample — which
+    is what makes it the honest headline number, and what makes §6's model fail
+    it outright. Watching this number is how you would know a bigger model or a
+    better sampler actually helped: here it is the difference between a
+    teaching-sized network and one trained on all of QM9.
     """)
     return
 
 
 @app.cell
-def _(batch, properties, sampling_batch, x_sampled):
+def _(batch, properties, sampling_batch, x_ancestral, x_direct):
     from ase.data import chemical_symbols
     from rdkit import Chem
     from rdkit.Chem import rdDetermineBonds
@@ -810,7 +969,8 @@ def _(batch, properties, sampling_batch, x_sampled):
 
     {
         "dataset (reference)": chemistry_summary(batch[properties.R], batch),
-        "generated (8 samples)": chemistry_summary(x_sampled, sampling_batch),
+        "direct denoising (8)": chemistry_summary(x_direct, sampling_batch),
+        "ancestral (8)": chemistry_summary(x_ancestral, sampling_batch),
     }
     return
 
@@ -869,7 +1029,8 @@ def _(mo):
     ```
 
     **Check your implementation against these questions:** how many model
-    calls does it take before it stops (the fixed loop above used 15)? What
+    calls does it take before it stops — and how does that compare with the two
+    fixed budgets above, 15 for direct denoising and 64 for the ladder? What
     happens for $\kappa \to 1$ and for $\kappa \to 0$? Why is it fine that
     molecules reach $\sigma_\text{min}$ at different iterations?
     """)
@@ -880,8 +1041,8 @@ def _(mo):
 def _(
     DEVICE,
     SIGMA_MIN,
+    big_process,
     force_param,
-    gpff_process,
     model_fn,
     plt,
     properties,
@@ -942,7 +1103,7 @@ def _(
     def solution_view():
         torch.manual_seed(6)
         vcd = VarianceConditionedDenoising(
-            gpff_process,
+            big_process,
             force_param,
             sampling_batch[properties.idx_m],
             sampling_batch[properties.n_atoms],
@@ -981,10 +1142,13 @@ def _(mo):
     axes — the *coupling* and the *prior* — are constructor arguments exactly
     like the process and the parametrization, and swapping them is how methods
     like flow matching with optimal transport or shaped priors are built.
-    Schedule-based sampling (`Sampler` with the `Ancestral` integrator and
-    friends) is the classical reverse-process route, and the one to use for
-    time-conditioned diffusion models. And the force-field side this tutorial
-    rode in on — property prediction, ML-driven molecular dynamics, and the
+    §7 assembled `Sampler` with one integrator and the default grid, and both
+    slots hold more: `Euler` and `Heun` integrate the reverse SDE or the
+    probability-flow ODE (`churn=0`) instead of stepping the exact posterior,
+    and a warped `grid` spends steps where the structure actually appears
+    rather than spreading them evenly — the usual first thing to tune when a
+    sampler needs to get cheaper. And the force-field side this tutorial rode
+    in on — property prediction, ML-driven molecular dynamics, and the
     Lightning/CLI training stack — is covered by the SchNetPack documentation
     and tutorials.
     """)
