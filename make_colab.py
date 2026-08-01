@@ -54,8 +54,9 @@ Nothing to install by hand: the cell below fetches SchNetPack and the tutorial
 files into this runtime. Run it first — it takes a couple of minutes, and only
 has to happen once per session.
 
-Everything here runs on CPU. A GPU runtime (*Runtime → Change runtime type →
-T4*) is optional; it only matters if you set `RETRAIN = True` in §6.\
+This notebook asks Colab for a **GPU** runtime. If you got one it is used
+automatically; if Colab handed you a CPU instead — free GPUs are rationed and
+not guaranteed — everything still runs, just see *Hardware* below.\
 """
 
 
@@ -169,7 +170,11 @@ def build(repo: str, pin: str, out: Path, schnetpack: Path = None) -> None:
     #    notebook still opens on its title and "the cell below" stays true
     at = hits[0] + 1
     nb["cells"] = cells[:at] + [setup_cell(repo, pin, wheel)] + cells[at:]
-    nb["metadata"]["colab"] = {"provenance": [], "toc_visible": True}
+    # Colab reads these when opening the notebook and starts a GPU runtime.
+    # It is only a request: if none is granted the notebook's own
+    # cuda.is_available() check falls back to CPU, which runs the tutorial fine.
+    nb["metadata"]["colab"] = {"provenance": [], "toc_visible": True, "gpuType": "T4"}
+    nb["metadata"]["accelerator"] = "GPU"
 
     out.write_text(json.dumps(nb, indent=1))
     n_code = sum(c["cell_type"] == "code" for c in nb["cells"])

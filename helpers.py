@@ -14,7 +14,21 @@ from schnetpack import properties
 __all__ = [
     "fully_connected_batch",
     "make_model_fn",
+    "to_device",
 ]
+
+
+def to_device(batch, device):
+    """Move every tensor of a SchNetPack batch dict onto ``device``.
+
+    Transforms run in the dataloader, i.e. on CPU, so a batch always arrives
+    on the host; this is the one hop to wherever the model lives. Non-tensor
+    entries are passed through untouched.
+    """
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
 
 
 def fully_connected_batch(numbers, n_mol):

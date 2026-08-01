@@ -49,7 +49,7 @@ def _(mo):
     ```
 
     Create an environment, install SchNetPack from the tutorial branch, and
-    start the notebook — everything runs on CPU:
+    start the notebook:
 
     ```bash
     conda create -n ml4chem python=3.12
@@ -62,6 +62,12 @@ def _(mo):
     This is a [marimo](https://marimo.io) notebook: cells form a dependency
     graph and re-run automatically when something they use changes. Every cell
     is plain Python — everything here works the same in a script.
+
+    **Hardware.** The first code cell sets `DEVICE` to a GPU when one is
+    available and to the CPU otherwise; the model and every batch follow it,
+    and nothing below is device-specific. The CPU is fast enough for the whole
+    tutorial — the trained model ships as a checkpoint — so the GPU only
+    matters if you set `RETRAIN = True` in §6.
     """)
     return
 
@@ -127,6 +133,10 @@ def _():
 
     from schnetpack.data import ASEAtomsData, AtomsLoader
 
+    # Everything downstream follows this one line: the GPU when this machine —
+    # or this Colab runtime — has one, the CPU otherwise.
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
     XYZ_FILE = os.path.join(HERE, "data", "qm9_c4h4n2o2.xyz")
     DB_PATH = os.path.join(HERE, "data", "qm9_c4h4n2o2.db")
@@ -144,8 +154,8 @@ def _():
                 {"energy": np.array([m.info["energy_U0"]])} for m in molecules
             ],
         )
-    f"{len(molecules)} × {molecules[0].get_chemical_formula()} → {DB_PATH}"
-    return ASEAtomsData, AtomsLoader, DB_PATH, HERE, numbers, os, torch
+    f"{len(molecules)} × {molecules[0].get_chemical_formula()} → {DB_PATH} · running on {DEVICE}"
+    return ASEAtomsData, AtomsLoader, DB_PATH, DEVICE, HERE, numbers, os, torch
 
 
 @app.cell
@@ -508,7 +518,7 @@ def _(mo):
 
 
 @app.cell
-def _(CUTOFF, torch):
+def _(CUTOFF, DEVICE, torch):
     import schnetpack.nn as snn
     from schnetpack.model import (
         AtomwiseVector,
@@ -529,8 +539,8 @@ def _(CUTOFF, torch):
         output_modules=[
             AtomwiseVector(n_in=32, n_layers=1, output_key="pseudo_force_pred")
         ],
-    )
-    f"GPFF model: {sum(p.numel() for p in gpff_net.parameters()):,} parameters"
+    ).to(DEVICE)
+    f"GPFF model: {sum(p.numel() for p in gpff_net.parameters()):,} parameters on {DEVICE}"
     return gpff_net, snn
 
 
@@ -562,8 +572,10 @@ def _(mo):
 
 
 @app.cell
-def _(HERE, gpff_net, gpff_process, os, torch, train_loader):
+def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
     import matplotlib.pyplot as plt
+
+    from helpers import to_device
 
     CKPT = os.path.join(HERE, "checkpoints", "gpff.pt")
     RETRAIN = False  # flip to train from scratch instead of loading the checkpoint
@@ -576,7 +588,7 @@ def _(HERE, gpff_net, gpff_process, os, torch, train_loader):
         return (weight[:, None] * diff**2).mean()
 
     if os.path.exists(CKPT) and not RETRAIN:
-        ckpt_state = torch.load(CKPT, weights_only=True)
+        ckpt_state = torch.load(CKPT, weights_only=True, map_location=DEVICE)
         gpff_net.load_state_dict(ckpt_state["state_dict"])
         history = [tuple(h) for h in ckpt_state["history"]]
     else:
@@ -585,6 +597,7 @@ def _(HERE, gpff_net, gpff_process, os, torch, train_loader):
         for epoch in range(260):  # 181 molecules / batch 10 → ~5000 steps
             for train_batch in train_loader:  # fresh (t, noise) draws every epoch
                 step += 1
+                train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
                 loss = gpff_loss(gpff_net(train_batch), train_batch)
                 optimizer.zero_grad()
                 loss.backward()
@@ -601,7 +614,7 @@ def _(HERE, gpff_net, gpff_process, os, torch, train_loader):
     loss_ax.set_ylabel("weighted pseudo-force MSE")
     loss_ax.grid(alpha=0.3)
     loss_fig
-    return gpff_model, plt
+    return gpff_model, plt, to_device
 
 
 @app.cell
@@ -635,12 +648,23 @@ def _(mo):
 
 
 @app.cell
-def _(force_param, gpff_model, gpff_process, numbers, properties, torch, viz):
+def _(
+    DEVICE,
+    force_param,
+    gpff_model,
+    gpff_process,
+    numbers,
+    properties,
+    to_device,
+    torch,
+    viz,
+):
     from helpers import fully_connected_batch, make_model_fn
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
-    sampling_batch = fully_connected_batch(numbers, n_mol=8)  # 8 molecules-to-be
+    # 8 molecules-to-be, laid out where the model lives
+    sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
     model_fn = make_model_fn(gpff_model, sampling_batch, "pseudo_force_pred")
 
     direct = DirectDenoisingSampler(gpff_process, force_param, stochastic_lambda=1.0)
@@ -648,7 +672,7 @@ def _(force_param, gpff_model, gpff_process, numbers, properties, torch, viz):
     # draw the start with the batch layout as context — each molecule's cloud
     # centered on its own — then run the denoising loop
     n_total = int(sampling_batch[properties.n_atoms].sum())
-    x_init = direct.prior.sample((n_total, 3), context=sampling_batch)
+    x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
     with torch.no_grad():
         x_sampled = direct.denoise(model_fn, x_init, n_steps=15)
 
@@ -684,7 +708,8 @@ def _(batch, properties, sampling_batch, torch, x_sampled):
         rows = []
         for m in range(int(layout[properties.n_atoms].shape[0])):
             pos = x[layout[properties.idx_m] == m]
-            dist = torch.cdist(pos, pos) + torch.eye(len(pos)) * 1e6  # mask self-pairs
+            eye = torch.eye(len(pos), device=x.device)
+            dist = torch.cdist(pos, pos) + eye * 1e6  # mask self-pairs
             nearest = dist.min(dim=1).values
             rows.append((float(nearest.min()), float(nearest.max())))
         return rows
@@ -770,6 +795,7 @@ def _(mo):
 
 @app.cell
 def _(
+    DEVICE,
     SIGMA_MIN,
     force_param,
     gpff_process,
@@ -839,13 +865,15 @@ def _(
             sampling_batch[properties.n_atoms],
         )
         x_start = vcd.prior.sample(
-            (int(sampling_batch[properties.n_atoms].sum()), 3), context=sampling_batch
+            (int(sampling_batch[properties.n_atoms].sum()), 3),
+            device=DEVICE,
+            context=sampling_batch,
         )
         with torch.no_grad():
             vcd.denoise(model_fn, x_start, n_steps=80)
 
         fig, ax = plt.subplots(figsize=(5.5, 3.2))
-        ax.semilogy(torch.stack(vcd.sigma_track).numpy(), alpha=0.8)
+        ax.semilogy(torch.stack(vcd.sigma_track).cpu().numpy(), alpha=0.8)
         ax.axhline(SIGMA_MIN, color="k", ls=":", lw=1)
         ax.set_xlabel("iteration (= model calls)")
         ax.set_ylabel(r"estimated $\hat\sigma_m$ [Å]")
