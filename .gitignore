@@ -1,0 +1,21 @@
+# Built by the notebook itself: §3 creates the SchNetPack database from the
+# shipped xyz on first run, and watching that happen is the point.
+data/*.db
+
+# Checkpoints are large and mostly experimental. Ship exactly the one the
+# tutorial loads — adding another is one line here, deliberately.
+checkpoints/*
+!checkpoints/gpff.pt
+
+# Development scripts: they stay on disk, they do not go to students.
+convert_gpff_seed999.py
+gpff_qm9.py
+sample_gpff_qm9.py
+sample_direct_gpff_qm9.py
+
+# Superseded copies kept for reference.
+*.bak
+
+__pycache__/
+__marimo__/
+*.pyc
