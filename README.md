@@ -1,5 +1,11 @@
 # ML4Chem hands-on tutorial — SchNetPack: from force fields to generative models
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/stefaanhessmann/ml4chem-tutorial/blob/main/notebook.ipynb)
+
+**Students: click the badge.** It opens your own copy in Google Colab — nothing
+to install, and everyone gets a separate machine. Run the first cell and work
+downwards.
+
 A single [marimo](https://marimo.io) notebook. It starts where SchNetPack
 starts — your own data in an ASE database, transforms, batches — and then
 builds a generative model out of the same pieces a machine-learned force field
@@ -59,22 +65,25 @@ there (or run `python make_checkpoints.py`) to train from scratch.
 ## Colab
 
 The same notebook runs in Google Colab, where students need no local install at
-all. `notebook.py` stays the source of truth; the `.ipynb` is **generated** —
-never hand-edit it:
+all — and, because Colab opens the badge link as a *fresh copy* on a *fresh
+VM*, a whole class can work at once without sharing anything.
+
+`notebook.py` stays the source of truth; `notebook.ipynb` is **generated** —
+never hand-edit it. After changing the notebook, rebuild and commit both:
 
 ```bash
-python make_colab.py --repo https://github.com/<owner>/<bundle> --pin <tag>
+python make_colab.py --repo https://github.com/stefaanhessmann/ml4chem-tutorial \
+                     --schnetpack ~/projects/schnetpack
 ```
 
-That exports via marimo, swaps the conda instructions above for a setup cell
-that pip-installs SchNetPack at `<tag>` and clones the bundle, and writes
-`notebook.ipynb`. Commit it, and link students at:
+That builds `schnetpack-*.whl` from your checkout, exports via marimo, swaps the
+conda instructions above for a setup cell that clones this repo and installs
+that wheel, and writes `notebook.ipynb`.
 
-```
-https://colab.research.google.com/github/<owner>/<bundle>/blob/main/notebook.ipynb
-```
-
-Pin a **tag**, not a branch — a branch moves under a class mid-course.
+The wheel is why students install in seconds: `pip install git+https://...`
+would have each of them clone ~66 MB of history and build it, where the wheel is
+~330 KB and pure Python. Being a file rather than a ref, it also pins the class
+to one exact build — firmer than a tag, which can be moved.
 
 Nothing else differs between the two. `viz.py` builds one self-contained page
 either way and only its last step branches on the frontend, so the viewers,
