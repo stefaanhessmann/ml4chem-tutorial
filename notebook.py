@@ -16,35 +16,32 @@ def _(mo):
     mo.md(r"""
     # SchNetPack: from force fields to generative models
 
-    **ML4Chem hands-on tutorial.** From loading your own dataset to
-    *generating* molecular structures with
+    **ML4Chem hands-on tutorial.** Build a diffusion model for molecular
+    structures out of
     [SchNetPack](https://github.com/atomistic-machine-learning/schnetpack)
-    and its new `schnetpack.generative` subpackage.
-
-    **Contents**
+    force-field parts, and generate molecules with it.
 
     1. **Setup**
-    2. **Introduction** — SchNetPack, force fields, and why generative models
-    3. **Using your own data** — ASE databases, transforms, batches
-    4. **Generative models in SchNetPack** — the roadmap
-    5. **Data augmentation** — noising structures, defining labels
-    6. **Model architecture and training** — a force field on noised structures
-    7. **Sampling** — direct denoising, ancestral sampling, and checking what we made
-    8. **Your tasks** — steering the sampler: shape guidance and scaffolds
+    2. **Introduction** — force fields and generative models
+    3. **Your own data** — databases, transforms, batches
+    4. **Roadmap** — the three parts of a diffusion model
+    5. **Forward process** — noising structures, defining labels
+    6. **Model and training** — a force field on noised structures
+    7. **Sampling** — ancestral, direct denoising, validation
+    8. **Your tasks** — steering the sampler
 
     ## 1. Setup
 
-    Everything you need ships in one folder:
+    Everything ships in one folder:
 
     ```
     ML4Chem-tutorial/
     ├── notebook.py            ← this tutorial
-    ├── data/
-    │   └── qm9_c4h4n2o2.xyz   ← the dataset: 181 small molecules from QM9
+    ├── data/qm9_c4h4n2o2.xyz  ← the dataset: 181 QM9 isomers of C₄H₄N₂O₂
     ├── checkpoints/
-    │   ├── gpff.pt            ← the §6 model; that cell loads it unless RETRAIN = True
-    │   └── gpff_big.pt        ← a GPFF at research scale (all of QM9); §7's switch swaps it in
-    ├── helpers.py             ← small glue code (batch adapters for sampling)
+    │   ├── gpff.pt            ← the §6 model; loaded unless RETRAIN = True
+    │   └── gpff_big.pt        ← the same model at research scale (all of QM9)
+    ├── helpers.py             ← glue: sampling batches, model adapters
     ├── viz.py                 ← 3D molecule viewer
     └── assets/3Dmol-min.js    ← vendored viewer library (works offline)
     ```
@@ -60,16 +57,14 @@ def _(mo):
     marimo edit notebook.py
     ```
 
-    This is a [marimo](https://marimo.io) notebook: cells form a dependency
-    graph and re-run automatically when something they use changes. Every cell
-    is plain Python — everything here works the same in a script.
+    In a [marimo](https://marimo.io) notebook, cells form a dependency graph
+    and re-run when their inputs change. Every cell is plain Python —
+    everything here works the same in a script.
 
-    **Hardware.** The first code cell sets `DEVICE` to a GPU when one is
-    available and to the CPU otherwise; the model and every batch follow it,
-    and nothing below is device-specific. Everything here is comfortable on
-    either: §6 ships its trained model, so the one genuinely GPU-hungry step —
-    training it yourself, with `RETRAIN = True` — is opt-in. That one is
-    roughly ten minutes on a GPU and much longer on a CPU.
+    **Hardware.** The first code cell points `DEVICE` at a GPU if there is one
+    and the CPU otherwise; nothing below is device-specific. The one
+    GPU-hungry step is opt-in — training §6's model with `RETRAIN = True`,
+    ~15 min on a GPU — and that cell loads a checkpoint by default.
     """)
     return
 
@@ -79,28 +74,26 @@ def _(mo):
     mo.md(r"""
     ## 2. Introduction
 
-    **SchNetPack** is an open-source toolbox for atomistic machine learning.
-    It is best known for **machine-learned force fields (MLFFs)**: neural
-    networks such as SchNet, PaiNN and SO3net that predict energies, forces
-    and other properties from atomic positions — plus the data pipelines to
-    train them and interfaces to run molecular dynamics with them. You bring
-    structures, it learns the potential energy surface.
+    **SchNetPack** is an open-source toolbox for atomistic machine learning,
+    best known for **machine-learned force fields (MLFFs)**: SchNet, PaiNN,
+    SO3net, and the data pipelines to train them.
 
-    **Generative models** answer a different question. A force field evaluates
-    structures it is *given*; a generative model *produces* structures — it
-    learns the distribution behind a dataset's geometries so that new,
-    plausible ones can be drawn from it. Diffusion-type models have become the
-    leading approach to this, and SchNetPack 3 ships their building blocks in
+    A force field *evaluates* structures it is given. A **generative model**
+    *produces* them — it learns the distribution behind a dataset's geometries
+    so that new, plausible ones can be drawn from it. Diffusion-type models
+    lead that field, and SchNetPack 3 ships their building blocks in
     `schnetpack.generative`.
 
-    **The two are close cousins.** A diffusion model's denoising network takes
-    a (noised) structure and predicts a 3-vector per atom — architecturally
-    that is exactly a force field of the non-energy-conserving kind. **GPFF**,
-    the Gaussian pseudo-force field, makes the kinship literal: the quantity it
-    learns *is* a pseudo force, pointing every atom back toward the clean
-    structure. The theory of diffusion models and GPFF was covered in the
-    lecture; this notebook is the hands-on counterpart — we build the training
-    data, the network and the sampler with SchNetPack, and generate molecules.
+    The two are close cousins:
+
+    - a denoising network reads a noised structure and predicts a 3-vector per
+      atom — architecturally a force field, of the non-energy-conserving kind;
+    - **GPFF** (the generative pseudo-force field) makes the kinship literal:
+      what it learns *is* a pseudo force, pointing every atom back toward the
+      clean structure.
+
+    The lecture covered the theory of diffusion models and GPFF; this notebook
+    builds one — forward process, network, sampler — and generates molecules.
     """)
     return
 
@@ -110,17 +103,16 @@ def _(mo):
     mo.md(r"""
     ## 3. Using your own data in SchNetPack
 
-    SchNetPack reads training data from an **ASE-backed SQLite database**.
-    Whatever format your structures are in, the first step is always the same:
-    put them in a db. Our raw data is an xyz file with all **181 isomers of
-    C₄H₄N₂O₂** from QM9 — one fixed composition, so the generative model later
-    only has to learn *where the atoms go*, not which atoms to place.
+    SchNetPack reads training data from an **ASE-backed SQLite database**;
+    whatever format your structures start in, step one is to put them in a db.
+    Ours is an xyz file with all **181 isomers of C₄H₄N₂O₂** in QM9 — one
+    fixed composition, so the generative model only has to learn *where the
+    atoms go*, not which atoms to place.
 
-    Two calls build the database: `ASEAtomsData.create` declares the stored
-    properties with their units, `add_systems` fills it with `ase.Atoms`
-    objects. We store the U0 energies that come with the xyz — this tutorial
-    never uses them, but a database declares its properties up front, and real
-    datasets carry them.
+    Two calls build it: `ASEAtomsData.create` declares the stored properties
+    with their units, `add_systems` fills it with `ase.Atoms`. We store the U0
+    energies from the xyz — unused here, but a database declares its properties
+    up front and real datasets carry them.
     """)
     return
 
@@ -165,21 +157,17 @@ def _(mo):
     mo.md(r"""
     ### Transforms and batches
 
-    A dataset item is a **dict of tensors** — positions `R`, atomic numbers
-    `Z`, ... — keyed by the names in `schnetpack.properties`. That dict is the
-    universal interface: every SchNetPack model consumes it, and everything we
-    build below writes into it.
-
-    **Transforms** are per-structure preprocessing steps owned by the dataset;
-    they run each time an item is loaded. Here: center each molecule
-    (`SubtractCenterOfGeometry`), build its neighbor list
-    (`MatScipyNeighborList` — with a 10 Å cutoff every atom sees every other),
-    and cast to float32 (`CastTo32`).
-
-    **Batches are not padded.** `AtomsLoader` concatenates the atoms of all
-    molecules along one axis and records in `idx_m` which atom belongs to
-    which molecule — a batch of 8 twelve-atom molecules is one `(96, 3)`
-    position tensor.
+    - A dataset item is a **dict of tensors** — positions `R`, atomic numbers
+      `Z`, … — keyed by `schnetpack.properties`. That dict is the universal
+      interface: every SchNetPack model consumes it, and everything we build
+      below writes into it.
+    - **Transforms** are per-structure preprocessing owned by the dataset,
+      re-run on every load. Here: center (`SubtractCenterOfGeometry`), build
+      the neighbor list (`MatScipyNeighborList`, 10 Å — which fully connects a
+      molecule), cast to float32 (`CastTo32`).
+    - **Batches are not padded.** `AtomsLoader` concatenates all atoms along
+      one axis and records in `idx_m` which molecule each belongs to: 8
+      twelve-atom molecules make one `(96, 3)` position tensor.
     """)
     return
 
@@ -222,18 +210,18 @@ def _(mo):
     mo.md(r"""
     ## 4. Generative models in SchNetPack: the roadmap
 
-    From the code perspective, a diffusion-based generative model consists of
-    **three parts**, and each part gets one section:
+    In code, a diffusion-based generative model is **three parts**, and each
+    gets one section:
 
     | | part | what it is | where |
     |---|---|---|---|
-    | a | **data augmentation** | the forward process: noising structures and computing labels, inside the dataloader | §5 |
+    | a | **forward process** | noising structures and computing labels, inside the dataloader | §5 |
     | b | **model architecture** | an MLFF-shaped network applied to noised structures | §6 |
     | c | **sampling** | iterating the trained model from noise to structures | §7 |
 
-    **Training** (§6) is where a and b meet; after sampling we **validate the
-    generated structures** (§7). The goal, stated plainly: train GPFF on our
-    181-molecule QM9 slice and generate new C₄H₄N₂O₂ geometries.
+    **Training** (§6) is where a and b meet; after sampling we **validate**
+    what came out (§7). The goal, plainly: train GPFF on our 181-molecule QM9
+    slice and generate new C₄H₄N₂O₂ geometries.
     """)
     return
 
@@ -241,42 +229,45 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 5. Data augmentation: making training data from noise
+    ## 5. The forward process: making training data from noise
 
     A force field trains on labels the dataset ships — energies, forces. A
-    diffusion model **manufactures its own training data**: take a clean
-    structure, blend noise into it, and ask the network for the way back.
-    `schnetpack.generative` frames the blending as an **interpolation**
-    between the data $x_0$ and an endpoint $x_1$ drawn from noise:
+    diffusion model **manufactures its own**: noise a clean structure, then ask
+    the network for the way back.
 
-    $$x_t = a(t)\,x_0 + b(t)\,x_1,$$
+    ### Noising
 
-    with $a(0) = 1, b(0) = 0$ (the data) and $b(1) = 1$ (pure noise). A
-    `Process` object owns the schedules $a$, $b$, the resulting noise level
-    $\sigma(t)$, and the endpoint draw.
+    `schnetpack.generative` writes the forward process as an **interpolation**
+    between the data $x_0$ and an endpoint $x_1$ drawn from a prior:
 
-    ### Generating noisy structures
+    $$x_t = a(t)\,x_0 + b(t)\,x_1, \qquad t \in [0, 1],$$
 
-    The two standard processes, both in the library:
+    with $a(0) = 1,\, b(0) \approx 0$ (the data) and $b(1) = 1$ (pure noise). A
+    `Process` owns $a$, $b$, the prior, and the noise level
+    $\sigma(t) = b(t)\,\sigma_\text{prior}$. The two standard schedules:
 
-    - **`VP`** (variance preserving — the DDPM family): the data is scaled
-      away ($a \to 0$) while noise of fixed scale blends in; the total
-      variance stays constant.
-    - **`VE`** (variance exploding — score matching): the data is never scaled
-      ($a \equiv 1$); noise whose scale grows geometrically from
-      $\sigma_\text{min}$ to $\sigma_\text{max}$ is *added* until it drowns
-      the structure. $\sigma_\text{max}$ must at least match the data scale —
-      rule of thumb: the largest pairwise distance, ~7.7 Å here. Too small and
-      the endpoint still remembers the data; too large and training wastes
-      capacity — and *neither failure is loud*. We take **30 Å**, which is
-      what the ready-trained generation model of §7 uses: staying on one
-      process keeps every model in this notebook interchangeable.
+    - **`VP`** (variance preserving — DDPM): $a = \sqrt{1 - b^2}$. The data is
+      scaled away as noise of fixed scale blends in; the total variance stays
+      constant.
+    - **`VE`** (variance exploding — score matching): $a \equiv 1$. The data is
+      never scaled, and noise is simply *added* until it drowns the structure:
 
-    For all illustrations we use a single molecule: an elongated, open-chain
-    isomer whose shape is easy to track through the noise. Below, that chain
-    under both processes with the same underlying noise draw (slider = $t$):
-    VP shrinks it into a small fixed-size cloud, VE leaves it in place and
-    buries it under a 30 Å one.
+    $$x_t = x_0 + \sigma(t)\,\varepsilon, \qquad
+      \sigma(t) = \sigma_\text{min}^{\,1-t}\,\sigma_\text{max}^{\,t}, \qquad
+      \varepsilon \sim \mathcal N(0, I).$$
+
+    We take **VE**, geometric from $\sigma_\text{min} = 0.05$ to
+    $\sigma_\text{max} = 30$ Å. $\sigma_\text{max}$ must at least match the
+    data scale — rule of thumb: the largest pairwise distance, ~7.7 Å here.
+    Too small and the endpoint still remembers the data, too large and training
+    wastes capacity, and *neither failure is loud*. 30 Å is what §7's
+    research-scale model was trained at, which keeps every model here
+    interchangeable.
+
+    Below — and in every illustration that follows — one elongated open-chain
+    isomer, easy to track through the noise, under both processes with the same
+    noise draw (slider = $t$). VP shrinks it into a small fixed-size cloud; VE
+    leaves it in place and buries it under a 30 Å one.
     """)
     return
 
@@ -319,34 +310,40 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Defining the labels: what should the network predict?
+    ### Labels: what should the network predict?
 
-    Noised structures are only half of the training data — the other half is
-    the **label**, and choosing it is the second axis: the `Parametrization`.
-    GPFF's choice is the **pseudo force**
+    Noised structures are half the training data; the **label** is the other
+    half, and choosing it is the second axis — the `Parametrization`. All three
+    below are one map away from each other. What separates them is how the
+    target's magnitude scales with $\sigma$, which is exactly what a plain L2
+    loss sees.
 
-    $$F = 2\,(x_0 - x_t), \qquad \mathrm{RMS}(F) = 2\,\sigma(t):$$
+    | parametrization | target | RMS per component | recover $x_0$ |
+    |---|---|---|---|
+    | `EpsParametrization` | $\varepsilon$ | $1$ | $x_t - \sigma\varepsilon$ |
+    | `ScoreParametrization` | $s = \nabla_x \log p_t(x_t) = -\varepsilon/\sigma$ | $1/\sigma$ | $x_t + \sigma^2 s$ |
+    | `PseudoForceParametrization` | $F = 2\,(x_0 - x_t)$ | $2\sigma$ | $x_t + F/2$ |
 
-    direction and distance straight back to the clean structure, so getting
-    home is one addition, $\hat x_0 = x_t + F/2$. And because its magnitude
-    *carries* the noise level, a GPFF network needs **no time input at all** —
-    remember this for §6. The second identity is that fact read backwards: a
-    trained GPFF can be *asked* how noisy a structure is, by measuring how long
-    the arrows are that it draws on it.
+    GPFF takes the **pseudo force**. On a VE path it collapses to
 
-    The lecture introduced the alternatives, and the library has them too:
-    `EpsParametrization` predicts the unit noise that was mixed in (same
-    typical arrow length at every noise level — the DDPM convention), and
-    `ScoreParametrization` the score, whose magnitude runs like $1/\sigma$.
+    $$F = 2\,(x_0 - x_t) = -2\,\sigma(t)\,\varepsilon,
+      \qquad \mathrm{RMS}(F) = 2\,\sigma(t),$$
 
-    Below, the same noising path three times, with the **training target drawn
-    as an arrow on every atom** — eps, score, pseudo force. The eps arrows
-    keep their size everywhere; the score arrows explode as $\sigma \to 0$;
-    the pseudo-force arrows are long in deep noise and shrink to nothing as
-    the structure comes home, which is $\mathrm{RMS}(F) = 2\sigma$ made
-    visible. That last row is drawn at **half length**, as $F/2 = x_0 - x_t$:
-    the arrow is then the offset itself, and its tip is where the atom is
-    headed.
+    which buys two things:
+
+    - getting home is one addition, $\hat x_0 = x_t + F/2$ — no division, so
+      nothing degenerates as $\sigma \to 0$;
+    - the magnitude of $F$ *carries* the noise level, so a GPFF network needs
+      **no time input at all**. Remember that for §6 and §7. Read backwards,
+      the same identity says a trained GPFF can be *asked* how noisy a
+      structure is.
+
+    Below, the same path three times, with the **target drawn as an arrow on
+    every atom**: eps arrows keep their size everywhere, score arrows explode
+    as $\sigma \to 0$, and pseudo-force arrows shrink to nothing as the
+    structure comes home — $\mathrm{RMS}(F) = 2\sigma$ made visible. That last
+    row is drawn at **half length**, $F/2 = x_0 - x_t$, so each arrow tip lands
+    on the clean structure.
     """)
     return
 
@@ -394,56 +391,49 @@ def _(chain, process, torch, viz, x0):
 @app.cell
 def _(mo):
     mo.md(r"""
-    Two further axes exist that this section does not vary: the **coupling**
-    (how the drawn $(x_0, x_1)$ pairs are matched up) and the **prior** (what
-    $x_1$ is drawn from) — equally swappable constructor arguments. The prior
-    comes back in §8b, where replacing it is half the task; the coupling stays
-    for the `schnetpack.generative` API docs.
+    Two further axes this section does not vary: the **coupling** (how the
+    drawn $(x_0, x_1)$ pairs are matched up) and the **prior** (what $x_1$ is
+    drawn from) — equally swappable constructor arguments. The prior returns in
+    §8b, where replacing it is half the task.
 
     ### Wrapping it into a transform
 
-    Building diffusion training data is preprocessing — so it is a
-    **transform** like the ones in §3. `Diffuse(process, parametrization)`
-    runs the forward process inside the dataloader: per structure it draws a
-    time, noises the positions, and writes the label into the item dict.
+    Building diffusion training data is preprocessing, so it is a **transform**
+    like §3's. `Diffuse(process, parametrization)` runs the forward process
+    inside the dataloader: per structure it draws a time, noises the positions,
+    and writes the label into the item dict.
 
-    *Where along the path* those draws land is its own choice — the **time
-    sampler**. Uniform $t$ on a geometric schedule is *log-uniform* in
-    $\sigma$: equal weight to every decade from 0.05 to 30 Å, so over a third
-    of the budget goes above 3 Å, where the target is nearly the endpoint
-    itself and there is little to learn. `LogNormalSigmaTimes` states the density
-    where the statement means something — in $\sigma$:
-    $\log\sigma \sim \mathcal N(-0.7,\, 1.2^2)$, a median of ~0.5 Å with most
-    of the mass between 0.15 and 1.7 Å — exactly the band where bonds live and
-    denoising is genuinely hard. `truncate=True` redraws the few samples that
-    land outside the schedule's range instead of piling them onto its ends.
-    This is GPFF's own training density (and EDM's, for images).
+    **Where those draws land** is its own choice — the `t_sampler`. Uniform $t$
+    on a geometric schedule is *log-uniform* in $\sigma$: equal weight to every
+    decade from 0.05 to 30 Å, so a third of the budget lands above 3 Å, where
+    the target is nearly the endpoint itself and there is little to learn.
+    `LogNormalSigmaTimes` states the density where it means something, in
+    $\sigma$:
 
-    The process does the converting, through `t_of_sigma`. Here that map is
-    closed-form and the arithmetic is pretty: on a geometric schedule $t$ is
-    *affine* in $\log\sigma$, so a log-normal over $\sigma$ is exactly a
-    normal over $t$ — $t \sim \mathcal N(0.36,\, 0.19^2)$ for these numbers.
+    $$\log \sigma \sim \mathcal N(-0.7,\; 1.2^2)$$
+
+    — median ~0.5 Å, most of the mass between 0.15 and 1.7 Å, the band where
+    bonds live and denoising is genuinely hard. This is GPFF's own training
+    density (and EDM's, for images). Since $t$ is *affine* in $\log\sigma$ on a
+    geometric schedule, it is exactly $t \sim \mathcal N(0.36,\, 0.19^2)$; the
+    process converts, through `t_of_sigma`. `truncate=True` redraws the few
+    draws falling outside the schedule instead of piling them onto its ends.
 
     Only the transform order needs thought:
 
-    1. `SubtractCenterOfGeometry` — diffusion lives in the centered frame,
-       and the prior draws its endpoints there too (`GaussianPrior` centers
-       per molecule by default): a translation-invariant network could never
-       predict a displacement of a whole structure, so an off-center endpoint
-       would be unlearnable noise in every label;
-    2. `Diffuse` — overwrites `R` with $x_t$, writes the label
-       `"pseudo_force"` and the time `"t"`;
-    3. `AllToAllNeighborList` — **after** noising, and every pair is a
-       neighbor. A *distance*-based list is the wrong tool here: one built on
-       $x_t$ at one noise level is wrong at another, and a cutoff wide enough
-       for a fully noised cloud (~90 Å across) would return every pair anyway
-       — at the cost of searching for them. Saying it directly is cheaper and
-       stays correct at every $t$. Pairs the model's cutoff function
-       downweights to zero cost nothing;
+    1. `SubtractCenterOfGeometry` — diffusion lives in the centered frame, and
+       the prior draws its endpoints there too. A translation-invariant network
+       could never predict a displacement of a whole structure, so an
+       off-center endpoint would be unlearnable noise in every label.
+    2. `Diffuse` — overwrites `R` with $x_t$, writes `"pseudo_force"` and `"t"`.
+    3. `AllToAllNeighborList` — **after** noising. A *distance*-based list
+       built at one noise level is wrong at another, and a cutoff wide enough
+       for a fully noised cloud (~90 Å across) returns every pair anyway, at
+       the cost of searching for them. Pairs the model's cutoff function
+       downweights to zero cost nothing.
     4. `CastTo32`.
 
-    An ordinary MSE against `"pseudo_force"` is then the whole training
-    objective — no special training loop anywhere.
+    An ordinary MSE against `"pseudo_force"` is then the whole objective.
     """)
     return
 
@@ -484,19 +474,17 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
 @app.cell
 def _(mo):
     mo.md(r"""
-    Those batches *are* the training set of our generative model — so look at
-    one. Below, ten structures drawn from the same loader: each at its own
-    randomly drawn time, captioned with its noise level, with the
-    **pseudo-force label drawn as an arrow on every atom** — again at half
-    length, $F/2$, so each arrow ends where its atom belongs.
+    Those batches *are* the training set — so look at one. Ten structures from
+    the same loader, each at its own drawn time, captioned with its noise
+    level, the **label drawn as an arrow on every atom** (again at half length,
+    so each arrow ends where its atom belongs).
 
-    Read it as a difficulty gradient. At $\sigma \lesssim 0.5$ Å the molecule
-    is intact and the arrows are tiny corrections; at $\sigma$ of several
-    Ångström there is no molecule left and the arrows span the whole cloud —
-    the label's scale runs with $\sigma$, which is exactly what the loss in
-    §6 will have to compensate. And notice what the time sampler did: most
-    draws sit below ~2 Å, where denoising is hard but learnable — the rare
-    deep-noise structure is in the mix, just no longer the bulk of it.
+    Read it as a difficulty gradient: at $\sigma \lesssim 0.5$ Å the molecule
+    is intact and the arrows are tiny corrections; at several Ångström there is
+    no molecule left and the arrows span the whole cloud. The label's scale
+    runs with $\sigma$ — exactly what §6's loss has to compensate. And note
+    what the time sampler did: most draws sit below ~2 Å, where denoising is
+    hard but learnable.
     """)
     return
 
@@ -520,41 +508,37 @@ def _(peek, process, properties, viz):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 6. Model architecture
+    ## 6. Model and training
 
-    A diffusion denoiser uses the **same architecture as an MLFF** — of the
-    *non-energy-conserving* kind: instead of predicting one energy per
-    molecule and differentiating it, the network reads out a 3-vector per atom
-    directly. Diffusion models generally need one extra ingredient, time
-    conditioning, because the same noised geometry means a different noise
-    target at a different $t$. **GPFF doesn't**: the pseudo force's own
-    magnitude carries the noise level, so the network here is *exactly* an
-    ordinary force field.
+    A diffusion denoiser uses the **same architecture as an MLFF**, of the
+    *non-energy-conserving* kind: a 3-vector read out per atom, rather than one
+    energy per molecule and differentiated. Diffusion models generally need
+    time conditioning on top, because the same noised geometry means a
+    different target at a different $t$. **GPFF does not** —
+    $\mathrm{RMS}(F) = 2\sigma$ carries the noise level — so this network is
+    *exactly* an ordinary force field.
 
-    `NeuralNetworkPotential` assembles a model from three stages, each a plain
-    `nn.Module` acting on the batch dict:
+    `NeuralNetworkPotential` stacks three stages, each an `nn.Module` acting on
+    the batch dict:
 
-    1. **Input modules** — geometric preparation: `PairwiseDistances` turns
-       positions + neighbor list into distance vectors.
-    2. **Representation** — message passing from atomic numbers and distances
-       to per-atom features. **PaiNN** is *equivariant*: besides scalars it
-       carries vector features that rotate with the molecule — which is what
-       lets a head output a well-behaved vector per atom. (SchNet and SO3net
-       are drop-in alternatives.)
-    3. **Output modules** — the head. `AtomwiseVector` reads PaiNN's vector
-       features and predicts a 3-vector per atom. (An energy model would end
-       in `Atomwise` instead: a scalar per atom, summed per molecule.)
+    1. **input** — `PairwiseDistances`: positions + neighbor list to distance
+       vectors.
+    2. **representation** — `PaiNN`, message passing to per-atom features. It
+       is *equivariant*: besides scalars it carries vector features that rotate
+       with the molecule, which is what lets a head output a well-behaved
+       vector per atom. (SchNet and SO3net are drop-in.)
+    3. **output** — `AtomwiseVector`, a 3-vector per atom. (An energy model
+       would end in `Atomwise`: a scalar per atom, summed per molecule.)
 
-    The cutoff is 150 Å because this force field sees *noised* structures — a
-    fully noised cloud is ~90 Å across. That number then decides a second one.
-    A `GaussianRBF` spreads its basis functions evenly over the cutoff, so 100
-    of them across 150 Å put one every 1.5 Å — wider than a bond, which leaves
-    a 1.0 Å contact and a 1.4 Å bond with 98% identical embeddings, and a
-    denoiser that cannot tell a clash from a bond will happily generate both.
-    600 puts one every 0.25 Å. `norm_epsilon=1` is the other concession to
-    noised inputs: PaiNN normalizes each pair direction as
-    $r_{ij}/(d_{ij} + 1)$ rather than $r_{ij}/d_{ij}$, which stays finite when
-    two atoms of a noise cloud land on top of each other.
+    Two settings are concessions to *noised* inputs:
+
+    - **cutoff 150 Å**, since a fully noised cloud is ~90 Å across — with 600
+      `GaussianRBF` functions across it, one every 0.25 Å. Too few, and a 1.0 Å
+      contact and a 1.4 Å bond get near-identical embeddings; a denoiser that
+      cannot tell a clash from a bond will happily generate both.
+    - **`norm_epsilon=1`**: PaiNN normalizes each pair direction as
+      $r_{ij}/(d_{ij} + 1)$ rather than $r_{ij}/d_{ij}$, which stays finite
+      when two atoms of a noise cloud land on top of each other.
     """)
     return
 
@@ -599,51 +583,45 @@ def _(mo):
     mo.md(r"""
     ### Training
 
-    Model and data augmentation meet in an ordinary PyTorch loop: pull a batch
-    from an `AtomsLoader` over §5's diffused dataset, compare the model's
-    prediction against the `"pseudo_force"` label, step the optimizer. Nothing
-    in the loop knows it is training a generative model — the transforms did
-    that part.
+    Data augmentation and model meet in an ordinary PyTorch loop: pull a batch
+    from an `AtomsLoader` over §5's diffused dataset, compare against the
+    `"pseudo_force"` label, step the optimizer. Nothing in the loop knows it is
+    training a generative model — the transforms did that part.
 
-    The loader is worth one look, because the obvious way to build it is slow.
-    181 structures at batch 64 is under three batches per epoch, and a
-    dataloader spends its first batches filling a prefetch queue that it then
-    throws away at the epoch boundary — so with tiny epochs the workers never
-    get ahead and the GPU waits. Handing it a `RandomSampler` with
-    `replacement=True` and `num_samples = BATCH * STEPS` turns the whole run
-    into *one* epoch of 12000 batches, drawn with replacement. The workers
-    pipeline, preprocessing hides behind the backward pass, and the training
-    loop becomes a single `for` over the loader.
+    **The objective:**
 
-    The one line worth arguing about is the **loss weight**
-    $\min(1/\sigma(t)^2, w_\text{max})$. The $1/\sigma^2$ undoes the label's
-    $\sigma$-scaling, so that what is being minimized is the *relative* error
-    at every noise level rather than the absolute one; without it the deep-noise
-    samples, whose labels are tens of Ångström long, drown out everything else.
-    The ceiling then decides how much of the small-$\sigma$ end survives, and
-    it is easy to set too low: at $w_\text{max} = 1$ it binds for 71% of the
-    draws, which flattens the weight back to "every sample counts the same"
-    across the whole band where bond lengths are decided. At 100 the weight is
-    the honest $1/\sigma^2$ almost everywhere.
+    $$\mathcal{L} = \mathbb{E}_{x_0,\,t,\,\varepsilon}
+      \Big[\, w(t)\,\big\| F_\theta(x_t) - F \big\|^2 \Big],
+      \qquad w(t) = \min\!\big(\sigma(t)^{-2},\; w_\text{max}\big).$$
 
-    Two things about the loop's shape. **Every step sees fresh
-    $(t, \text{noise})$ draws**, because the transforms re-run on every item
-    the loader hands out — the dataset is effectively infinite, and a model
-    that saw a fixed set of noised structures (say, from an
-    `itertools.cycle` over a cached list of batches) would memorize them
-    instead of learning the denoising field. And the weights that get used
-    downstream are an **exponential moving average** of the ones the optimizer
-    visited: a few thousand steps is a noisy place to stop, and the averaged
-    model samples visibly better than whichever iterate happened to be last.
+    The $1/\sigma^2$ undoes the label's $\sigma$-scaling, so what is minimized
+    is the *relative* error at every noise level rather than the absolute one;
+    without it the deep-noise samples, whose labels are tens of Ångström long,
+    drown out everything else. The ceiling decides how much of the
+    small-$\sigma$ end survives, and it is easy to set too low: at
+    $w_\text{max} = 1$ it binds for 71% of the draws, flattening the weight
+    across the whole band where bond lengths are decided. At **100** it is the
+    honest $1/\sigma^2$ almost everywhere.
 
-    The cell below **loads** that run by default, from
-    `checkpoints/gpff.pt` — twelve thousand steps is a quarter of an hour on a
-    laptop GPU and considerably worse on a CPU, which is a long time to sit and
-    watch. Set `RETRAIN = True` to run it yourself instead; the loop is right
-    there, and it overwrites the checkpoint when it finishes. Either way the
-    curve below is real: the checkpoint stores its loss history alongside its
-    weights. Don't over-read it — it plateaus well above zero because every
-    noise level keeps an irreducible error, and that is healthy.
+    Three things about the loop:
+
+    - **Every step sees fresh $(t, \varepsilon)$ draws** — the transforms
+      re-run on every item the loader hands out, so the dataset is effectively
+      infinite. A model fed a fixed set of noised structures would memorize
+      them instead of learning the denoising field.
+    - The weights used downstream are an **exponential moving average** of the
+      ones the optimizer visited: a few thousand steps is a noisy place to
+      stop, and the average samples visibly better.
+    - The loader draws **with replacement**, `num_samples = BATCH * STEPS`, so
+      the run is *one* epoch of 12000 batches. Otherwise 181 structures at
+      batch 64 is under three batches per epoch, and a dataloader that throws
+      away its prefetch queue that often never gets ahead of the GPU.
+
+    The cell **loads** `checkpoints/gpff.pt` by default; `RETRAIN = True` runs
+    the loop instead and overwrites it. Either way the curve below is real —
+    the checkpoint stores its loss history alongside its weights. It plateaus
+    well above zero because every noise level keeps an irreducible error, and
+    that is healthy.
     """)
     return
 
@@ -733,27 +711,26 @@ def _(mo):
     mo.md(r"""
     ## 7. Sampling
 
+    Sampling runs the process backwards: start from a draw of the prior — a
+    30 Å cloud — and call the model over and over until a molecule is left.
+    Both samplers below do that with the same trained model; what they disagree
+    about is *how*.
+
     ### The model that generates
 
-    Everything from here on — both samplers and your tasks in §8 — runs on the
-    model §6 just trained, a **teaching-sized** network on 181 structures.
-    Denoising has to be accurate exactly where geometry is decided, at
-    $\sigma \lesssim 0.3$ Å where bond lengths live — which is precisely
-    where the time sampler concentrated its training. How well that worked is
-    what the validation cells below measure; don't expect perfection from a
-    model this size trained on 181 molecules. Roughly half of what it draws is
-    a chemically valid molecule, and essentially all of it is sane geometry —
-    which, at this scale, is the honest answer.
+    §6's network is **teaching-sized** and saw 181 structures. Denoising has to
+    be accurate exactly where geometry is decided, at $\sigma \lesssim 0.3$ Å
+    where bond lengths live — precisely where the time sampler concentrated its
+    training. Expect roughly half the draws to be chemically valid molecules
+    and nearly all of them to be sane geometry; the cells below measure it.
 
-    For comparison the bundle also ships `checkpoints/gpff_big.pt`: a GPFF
-    trained the same way — same pseudo-force target, same VE process, same
-    $\sigma$-focused time sampling — but at research scale: **5.1M
-    parameters, trained on all ~130k molecules of QM9**. The assembly below is
-    the same `NeuralNetworkPotential` of §6 — same process, same cutoff, same
-    radial basis — with
-    `USE_BIG_MODEL` swaps it into every sampling and validation cell that
-    follows. Flip it after one pass through §7: how far the numbers move is
-    the most honest measure of what scale buys.
+    The bundle also ships `checkpoints/gpff_big.pt`: same pseudo-force target,
+    same VE process, same $\sigma$-focused time sampling, at **research scale —
+    5.1M parameters, trained on all ~130k molecules of QM9**. The cell below
+    assembles it exactly like §6's model, only wider, and `USE_BIG_MODEL` swaps
+    it into every sampling and validation cell that follows. Flip it after one
+    pass: how far the numbers move is the most honest measure of what scale
+    buys.
     """)
     return
 
@@ -812,14 +789,29 @@ def _(mo):
     mo.md(r"""
     ### Ancestral sampling
 
-    The **classical** route to a sample — the reverse process of the lecture,
-    and what every time-conditioned diffusion model uses — walks a
-    *prescribed* ladder of noise levels
-    $\sigma_N > \sigma_{N-1} > \dots > \sigma_0$ and takes one exact step
-    down each rung.
+    The **classical** route — the reverse process of the lecture, and what
+    every time-conditioned diffusion model uses. Walk a *prescribed* ladder of
+    noise levels $1 = t_N > \dots > t_0 = 0$, write $\sigma_k = \sigma(t_k)$,
+    and take one exact step down each rung. At rung $k$:
 
-    SchNetPack assembles that from four parts, which is the same decomposition
-    as §5's — process and parametrization, plus two that only sampling needs:
+    $$\hat x_0 = x_{t_k} + \tfrac{1}{2} F_\theta(x_{t_k})
+      \qquad \text{(one model call)}$$
+
+    $$x_{t_{k-1}} = \frac{\sigma_{k-1}^2}{\sigma_k^2}\, x_{t_k}
+      \;+\; \Big(1 - \frac{\sigma_{k-1}^2}{\sigma_k^2}\Big)\, \hat x_0
+      \;+\; \tilde\sigma_k\, z, \qquad z \sim \mathcal N(0, I),$$
+
+    $$\tilde\sigma_k^2
+      = \frac{\sigma_{k-1}^2\,\big(\sigma_k^2 - \sigma_{k-1}^2\big)}{\sigma_k^2}.$$
+
+    That is the **exact Gaussian posterior**
+    $p(x_{t_{k-1}} \mid x_{t_k}, \hat x_0)$ — no approximation beyond the
+    model's own error. Read the update as an interpolation: the closer two
+    rungs sit, the more weight stays on $x_{t_k}$ and the less the estimate
+    $\hat x_0$ is trusted in one go.
+
+    SchNetPack assembles it from four parts — §5's two, plus two only sampling
+    needs:
 
     | part | what it decides | here |
     |---|---|---|
@@ -828,38 +820,30 @@ def _(mo):
     | `integrator` | how one step down the ladder is taken | `Ancestral` |
     | `grid` | where the rungs sit | uniform in $t$ (the default) |
 
-    `Ancestral` takes the exact step: it converts the prediction into an
-    estimate $\hat x_0$, then draws from the closed-form Gaussian for
-    $x_{\sigma_{k-1}}$ given $x_{\sigma_k}$ and $\hat x_0$ — no approximation
-    beyond the model's own error. On a VE-family process that reduces to the
-    familiar score-form update. And because VE's $\sigma$ grows
-    *geometrically* in $t$, a uniform grid already gives the geometric ladder
-    score matching wants — rungs that bunch up where $\sigma$ is small — so no
-    schedule code is needed. (Warping the grid is still an option, and the
-    `grid` slot is where it would go; see the outro.)
+    Because VE's $\sigma$ grows *geometrically* in $t$, a uniform grid already
+    gives the geometric ladder score matching wants — rungs that bunch up where
+    $\sigma$ is small — so no schedule code is needed. (Warping the grid stays
+    an option, and `grid` is where it would go.)
 
-    Two pieces of glue from `helpers.py`. `fully_connected_batch` lays out 8
-    copies of our composition as one flat batch — the topology the model needs
-    (`Z`, `idx_m`, and a neighbor list) for molecules that don't exist yet.
-    `make_model_fn` adapts our batch-dict model to the plain-tensor contract
-    `model(x, t, cond)` the sampler expects, binding everything except the
-    positions. The neighbor list is static: atoms move at every step, but the
-    cutoff function handles the changing distances, so nothing is rebuilt.
+    Three pieces of glue from `helpers.py`:
 
-    A third, `recording_model_fn`, is what makes the viewer below a **movie**
-    rather than a still. A sampler returns the structure it ended on and
-    nothing else — but every step passes its state through the model, so
-    wrapping the model captures the whole run without the sampler knowing.
-    One box per molecule, as before — they just move now. Scrub the slider;
-    the frames carry the grid's own times, so the caption reads out the rung
-    each one sits on, $t = 1$ down to $0$: the ladder comes down *gradually*,
-    and the structure only appears over the last handful of rungs.
+    - `fully_connected_batch` — 8 copies of our composition as one flat batch:
+      the topology (`Z`, `idx_m`, a neighbor list) for molecules that do not
+      exist yet. It stays static, since the cutoff function handles the
+      changing distances.
+    - `make_model_fn` — adapts our batch-dict model to the sampler's
+      plain-tensor `model(x, t, cond)` contract.
+    - `recording_model_fn` — what makes the viewer a **movie**: a sampler
+      returns only the structure it ended on, but every step passes its state
+      through the model, so wrapping the model captures the whole run.
 
-    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 30$ Å, so
-    the starting cloud is ~80 Å across against a ~3 Å molecule — a 25× range no
-    single camera can hold. The view is framed on the finished structure and
-    pulled back (`zoom=0.35`), so the earliest frames spill past the edges and
-    the atoms fly in from outside. That gap *is* the scale the model closes.
+    Scrub the slider. The frames carry the grid's own times, so each caption
+    reads out the rung it sits on, $t = 1$ down to $0$: the ladder comes down
+    *gradually*, and a structure appears only over the last handful of rungs.
+    Frame 0 is a ~80 Å cloud against a ~3 Å molecule — no camera holds a 25×
+    range, so the view is framed on the finished structure and pulled back
+    (`zoom=0.35`), and the atoms fly in from outside. That gap *is* the scale
+    the model closes.
     """)
     return
 
@@ -935,42 +919,40 @@ def _(mo):
     mo.md(r"""
     ### Direct denoising
 
-    GPFF's own sampler is unusual: no schedule, no time grid, nothing that
-    tracks how noisy the iterate is. It can afford that because the pseudo
-    force is the way home in *one* step, $\hat x_0 = x + F/2$. Taken from pure
-    noise that single jump lands on the model's *conditional mean* over every
-    structure that could hide under it — a blob, not a molecule — so sampling
-    iterates instead: denoise, re-noise a little, repeat.
+    GPFF's own sampler has no schedule, no time grid, and never asks how noisy
+    its iterate is. It can afford that because the pseudo force is the way home
+    in *one* step, $\hat x_0 = x + F_\theta(x)/2$. Taken from pure noise, that
+    single jump lands on the model's *conditional mean* over every structure
+    that could hide under it — a blob, not a molecule — so the sampler iterates
+    instead. For $k = 1 \dots N$:
 
-    That loop is `DirectDenoisingSampler`. At iteration $k$ of $N$ it injects
-    $\lambda\,(1 - k/N)$ of noise before the model call, decaying to zero. It
-    never asks what noise level its iterate sits at, which is only possible
-    because the model doesn't either.
+    $$x \;\leftarrow\; x + \lambda\Big(1 - \frac{k}{N}\Big) z,
+      \qquad z \sim \mathcal N(0, I)$$
 
-    $\lambda$ deserves a moment, because $\lambda = 0$ — the plain repeated
-    jump, no injection at all — looks like the natural choice and is the wrong
-    one. With nothing put back the loop is a deterministic fixed-point
-    iteration, and it converges to whatever the model's map happens to
-    attract: for a live-trained model that means atoms stranded off the
-    structure, and occasionally a run that leaves the finite numbers behind
-    altogether. The injection keeps the iterate inside the band the model was
-    trained on, and the decay walks it down from there. Here $\lambda = 1$,
-    and on the validation counts below it is the difference between a third of
-    the samples passing and nearly all of them.
+    $$x \;\leftarrow\; x + \tfrac{1}{2} F_\theta(x)$$
 
-    Compare the two samplers on cost. The ladder above took **64** model
-    calls; this loop takes **60**. They are close here because this model is
-    small and wants the iterations — the loop's budget is a dial rather than a
-    schedule, and a stronger model gets away with far fewer (flip
-    `USE_BIG_MODEL` and 15 is plenty). Both are `schnetpack.generative`
-    one-liners over the same trained model, so swapping them is a one-line
-    experiment.
+    — re-noise a little, jump home, repeat, with the injection decaying to
+    zero. No $t$ appears anywhere, which is only possible because the model
+    does not need one either. That loop is `DirectDenoisingSampler`.
 
-    Watch the difference in the movie. Where the ladder descended gradually
-    and only revealed a structure near the bottom, direct denoising is at
-    molecular size after two or three calls and spends everything after that
-    tidying up; the last frame is the sample. Same model, same starting
-    noise — only the route differs.
+    $\lambda = 0$ — the plain repeated jump, no injection at all — looks like
+    the natural choice and is the wrong one. With nothing put back, the loop is
+    a deterministic fixed-point iteration that converges to whatever the
+    model's map happens to attract: atoms stranded off the structure, and
+    occasionally a run that leaves the finite numbers behind altogether. The
+    injection keeps the iterate inside the band the model was trained on, and
+    the decay walks it down. Here $\lambda = 1$, and on the counts below it is
+    the difference between a third of the samples passing and nearly all.
+
+    **Cost.** The ladder above took **64** model calls; this loop takes **60**
+    — close, because this model is small and wants the iterations. The budget
+    is a dial rather than a schedule, so a stronger model gets away with far
+    fewer (flip `USE_BIG_MODEL` and 15 is plenty).
+
+    Watch the difference in the movie: where the ladder descended gradually and
+    revealed a structure only near the bottom, direct denoising is at molecular
+    size after two or three calls and spends the rest tidying up. Same model,
+    same starting noise — only the route differs.
     """)
     return
 
@@ -1014,16 +996,16 @@ def _(mo):
 
     A rendered batch can look right and still hide broken geometry — so turn
     "it looks like molecules" into numbers. The simplest checks live on each
-    structure's nearest-neighbor distances: two atoms closer than **0.7 Å**
-    are fused (a *clash*), an atom whose nearest neighbor is beyond **2.5 Å**
-    isn't bonded to anything (a *stray*). Running the same checks on a clean
-    dataset batch calibrates them: real bond lengths here are ~1.0–1.5 Å, and
-    the dataset scores zero on both counts by construction.
+    structure's nearest-neighbor distances:
 
-    Both samplers are scored, against the dataset row. Being able to say *how
-    many* is the point: that number is what tells you whether a change to the
-    model, the process or the sampler actually helped — and, one flip of
-    `USE_BIG_MODEL` later, it is what shows what research scale changes.
+    - two atoms closer than **0.7 Å** are fused — a *clash*;
+    - an atom whose nearest neighbor is beyond **2.5 Å** is bonded to
+      nothing — a *stray*.
+
+    The dataset row calibrates both: real bond lengths here are ~1.0–1.5 Å, and
+    a clean batch scores zero on each by construction. Being able to say *how
+    many* is the point — that number is what tells you whether a change to the
+    model, the process or the sampler actually helped.
     """)
     return
 
@@ -1065,25 +1047,23 @@ def _(mo):
     mo.md(r"""
     ### From geometry to chemistry
 
-    Distance checks ask whether the geometry is *sane* — they never ask
-    whether it is a *molecule*. RDKit can: `rdDetermineBonds` infers a bond
-    graph from nothing but the coordinates, and the structure counts as
-    **chemically valid** only if that graph works out — every valence
-    satisfied as a neutral molecule, no unpaired electrons left over, and
-    everything in one connected piece. A structure that passes earns a
-    **SMILES** string: the molecule's identity, independent of coordinates.
+    Distance checks ask whether the geometry is *sane* — never whether it is a
+    *molecule*. RDKit can: `rdDetermineBonds` infers a bond graph from nothing
+    but the coordinates, and a structure counts as **chemically valid** only if
+    that graph works out — every valence satisfied as a neutral molecule, no
+    unpaired electrons left over, everything in one connected piece. What
+    passes earns a **SMILES** string: the molecule's identity, independent of
+    coordinates.
 
-    That string is what makes this more than a stricter filter. The *valid
-    fraction* is the standard headline metric for molecular generative
-    models, and SMILES says *which* molecule each sample is — compare them
-    against the dataset's to see whether the model reproduced a training
-    isomer or found a new one. The dataset batch calibrates the check once
-    more: relaxed QM9 structures pass it.
+    - the **valid fraction** is the standard headline metric for molecular
+      generative models;
+    - **SMILES** says *which* molecule each sample is — compare against the
+      dataset's to see whether the model reproduced a training isomer or found
+      a new one.
 
-    It is a *strict* judge — a single fused pair already sinks a sample —
-    which is what makes it the honest headline number. Watching it is how you
-    know a bigger model or a better sampler actually helped: flip
-    `USE_BIG_MODEL` and see what a network trained on all of QM9 does to it.
+    It is a *strict* judge: a single fused pair already sinks a sample, which
+    is what makes it honest. Flip `USE_BIG_MODEL` and see what a network
+    trained on all of QM9 does to it.
     """)
     return
 
@@ -1138,40 +1118,37 @@ def _(mo):
 
     Both samplers of §7 draw from the *whole* distribution the model learned:
     hand them noise and they hand back some molecule. Neither takes an
-    instruction — and nearly every real use of a generative model is one. Make
-    it long and thin. Keep this ring and fill in the rest.
+    instruction — and nearly every real use of a generative model is one. *Make
+    it long and thin. Keep this ring and fill in the rest.*
 
-    The obvious way there is to train for it, conditioning the network on
-    whatever you want to ask for. Both tasks below take the other route and
-    leave the trained model **exactly as it is**: the instruction enters in the
-    *sampler*. They share one recipe — every iteration, force the state onto
-    the constraint, then let the model repair whatever that broke. Because a
-    model call always follows the nudge, the repair is chemistry rather than
-    interpolation: what comes out satisfies the constraint *and* survives the
-    denoiser. The alternation is the whole trick; either half alone does not
-    work.
+    The obvious way there is to train for it. Both tasks below take the other
+    route and leave the trained model **exactly as it is**: the instruction
+    enters in the *sampler*, through one shared recipe.
 
-    Two kinds of constraint worth knowing, one each:
+    > Every iteration, force the state onto the constraint, then let the model
+    > repair whatever that broke.
+
+    Because a model call always follows the nudge, the repair is chemistry
+    rather than interpolation: what comes out satisfies the constraint *and*
+    survives the denoiser. The alternation is the whole trick — either half
+    alone does not work.
 
     | | the constraint | how it enters |
     |---|---|---|
     | **a** | a **global, continuous** property — the structure's shape | a linear map on the state, before every model call |
     | **b** | **exact positions** for some atoms — a scaffold | a custom prior, plus rows the loop never updates |
 
-    **How to work them.** Each task ships two cells: one holding a class for
-    you to fill in — it *runs* as shipped, it just doesn't steer anything yet —
-    and, under it, a cell that samples with whatever you wrote and plays the
-    result as a movie. So the loop is short: edit, re-run, watch the movie
-    change. Both classes subclass `DirectDenoisingSampler`, whose loop is four
-    lines and carries no schedule to stay consistent with, which makes it the
-    one to interfere with.
+    **How to work them.** Each task is two cells: a class with `# TODO` markers
+    to fill in, and under it a runner that samples with whatever you wrote and
+    plays it as a movie. The class **runs as shipped** — it just steers nothing
+    yet, so the first movie you get is §7's unguided sampler. Your job is to
+    make it change: edit, re-run, watch.
 
-    One thing is switched for you. §7's `USE_BIG_MODEL` decides what §7 samples
-    with; **these two tasks always use the research-scale model**, whatever
-    that switch says. You are steering a sampler here, and the effect of
-    steering is only legible when the model underneath is not the bottleneck —
-    the teaching-sized network of §6 would swamp both signals with its own
-    error.
+    Both subclass `DirectDenoisingSampler`, whose loop is four lines and
+    carries no schedule to stay consistent with — which makes it the one to
+    interfere with. And both always use the **research-scale model**, whatever
+    §7's `USE_BIG_MODEL` says: steering is only legible when the model
+    underneath is not the bottleneck.
     """)
     return
 
@@ -1201,60 +1178,59 @@ def _(mo):
 
     **Shape** — rod, disc, ball — is a property of the atom cloud rather than
     of its chemistry, and three numbers hold it. Center a structure and form
-    the 3×3 covariance of its positions,
+    the 3×3 covariance of its positions:
 
     $$C = \frac{1}{n}\sum_i x_i x_i^\top
         = V \operatorname{diag}(\lambda_1 \ge \lambda_2 \ge \lambda_3) V^\top .$$
 
-    The eigenvectors are the **principal axes** and $\lambda_i$ the variance
-    along each. Their sum $\operatorname{tr} C$ is the mean squared distance
-    from the center — the structure's *size* — and the normalized triple
-    $r_i = \lambda_i / \operatorname{tr} C$ is its *shape*: unchanged by
-    rotation, and independent of size. Our 181 isomers run from
-    $r = (0.41, 0.33, 0.26)$, the roundest of them, to $(0.89, 0.09, 0.02)$,
-    the open chain §5 kept noising — and $r_3$ averages $0.03$ over the set,
-    which is these molecules saying they are flat.
+    - the columns of $V$ are the **principal axes**, $\lambda_i$ the variance
+      along each;
+    - $\operatorname{tr} C = \sum_i \lambda_i$ is the mean squared distance
+      from the center — the structure's **size**;
+    - $r_i = \lambda_i / \operatorname{tr} C$ is its **shape**: unchanged by
+      rotation, and independent of size.
 
-    **Make the sampler generate at a *prescribed* $r^\ast$.** Once per
-    iteration, before the model is called, stretch and squeeze the current
-    structure onto the target: eigendecompose its covariance, then scale along
-    each principal axis by
+    Our 181 isomers run from $r = (0.41, 0.33, 0.26)$, the roundest of them, to
+    $(0.89, 0.09, 0.02)$, the open chain §5 kept noising — and $r_3$ averages
+    $0.03$, which is these molecules saying they are flat.
+
+    **Your task: make the sampler generate at a prescribed $r^\ast$.** Once per
+    iteration, *before* the model is called, stretch and squeeze the current
+    structure onto the target — eigendecompose its covariance, then scale along
+    principal axis $i$ by
 
     $$s_i = \sqrt{\frac{r_i^\ast \operatorname{tr} C}{\lambda_i}},
-      \qquad x \leftarrow V \operatorname{diag}(s)\, V^\top x,$$
+      \qquad x \;\leftarrow\; V \operatorname{diag}(s)\, V^\top x,$$
 
-    and hand *that* to the model. Since $\sum_i r_i^\ast = 1$ the new variances
-    again sum to $\operatorname{tr} C$: the map **preserves the total** and
-    only moves variance between axes. That restriction is what keeps the task
-    well-posed. Total variance is fixed by bond lengths and atom count, neither
-    of which you are free to choose — a guidance that inflated it too would be
-    demanding a molecule whose bonds are 20% too long, and the next model call
-    would spend itself undoing the demand instead of following it.
+    and hand *that* to the model.
+
+    Since $\sum_i r_i^\ast = 1$, the new variances again sum to
+    $\operatorname{tr} C$: the map **preserves the total** and only moves
+    variance between axes. That restriction keeps the task well-posed — total
+    variance is fixed by bond lengths and atom count, neither of which you are
+    free to choose, and a guidance that inflated it too would be demanding a
+    molecule whose bonds are 20% too long.
 
     Why before *every* call rather than once on the finished sample? Applied
     once, this is not guidance but damage: every bond along the long axis
     stretched by $s_1$, and the validity check will say so. Applied every
     iteration, each squeeze is small and the denoising step right after repairs
-    it — toward a structure that is already leaning the way you asked. That
-    alternation is the general recipe: the model supplies *is a molecule*, the
-    map supplies *has this shape*, and the loop looks for something that is
-    both.
+    it — toward a structure already leaning the way you asked.
 
-    Two edits, both marked `TODO` in the cell below: write `reshape`, and put
-    it in the loop. As shipped it reshapes nothing, so the movie you get is
-    §7's unguided sampler — your job is to make that movie change. The panel
-    captions measure you: each reads out the $r_1$ its molecule actually
-    reached, next to the molecule it turned out to be.
+    **Two `# TODO`s in the next cell:** write `reshape`, then call it in the
+    loop. The panel captions measure you — each reads out the $r_1$ its
+    molecule actually reached, next to the molecule it turned out to be.
 
-    **Check your implementation against these questions:** how close does the
-    achieved $r_1$ get to the target — and which target does the model fight
-    hardest? (Change `SHAPE_TARGET` to the disc and to the ball; hold all three
-    against the dataset's range above.) On the ball run, read the molecule
-    names: a planar ring cannot fill three dimensions, so what does the model
-    reach for instead? What happens if you drop the trace preservation and
-    scale the total variance by 1.5 as well — and at which point in the loop
-    does that show? And what do the names do if you reshape *only once*, on the
-    finished sample?
+    **Then ask:**
+
+    - How close does the achieved $r_1$ get, and which target does the model
+      fight hardest? Try `SHAPE_TARGET` as the disc and the ball, and hold all
+      three against the dataset's range above.
+    - On the ball run, read the molecule names: a planar ring cannot fill three
+      dimensions, so what does the model reach for instead?
+    - Drop the trace preservation and scale the total variance by 1.5 as well.
+      What breaks — and at which point in the loop does it show?
+    - Reshape *only once*, on the finished sample. What happens to the names?
     """)
     return
 
@@ -1276,18 +1252,22 @@ def _(DirectDenoisingSampler, torch):
 
         def reshape(self, x):
             """Scale each molecule along its own principal axes onto `target`."""
+            target = self.target.to(x.device, x.dtype)  # r*, descending
             out = x.clone()
             for m in range(self.n_mol):
                 rows = self.idx_m == m
                 pos = x[rows]
                 pos = pos - pos.mean(0)  # each molecule on its own center
-                # TODO ------------------------------------------------------
-                # Eigendecompose this molecule's 3x3 covariance
-                # (`torch.linalg.eigh` returns ascending eigenvalues and the
-                # matching axes as *columns*), build the per-axis factor s_i of
-                # the formula above, and write the rescaled positions back.
-                out[rows] = pos  # as shipped: no reshaping at all
-                # -----------------------------------------------------------
+
+                # TODO (1 of 2) — rescale `pos` onto `target`:
+                #   1. eigendecompose this molecule's 3×3 covariance
+                #      (`torch.linalg.eigh` gives ascending eigenvalues, and
+                #       the matching axes as *columns*; `.flip()` both to get
+                #       descending, so they line up with `target`)
+                #   2. build the per-axis factors s_i of the formula above
+                #   3. rotate into the principal frame, scale there, rotate back
+
+                out[rows] = pos  # ← as shipped: no reshaping at all
             return out
 
         def denoise(self, model, x_t, n_steps, cond=None):
@@ -1298,8 +1278,9 @@ def _(DirectDenoisingSampler, torch):
                 noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
                 if noise_scale > 0.0:
                     x = x + noise_scale * torch.randn_like(x)
-                # TODO: one line — the state that goes into the model should be
-                # the reshaped one
+
+                # TODO (2 of 2) — one line: the state handed to the model on
+                # the next line should be the reshaped one
                 x = self.parametrization.to_x0(
                     self.process, model(x, t, cond), x, t
                 )
@@ -1386,53 +1367,53 @@ def _(mo):
     — a ring that binds, a core a synthesis route exists for — and what is
     wanted is everything around it.
 
-    Ours: **uracil**. C₄H₄N₂O₂ is uracil's formula, so the RNA base is one of
-    our 181 isomers (index 7) and its six-membered ring is a scaffold worth
-    keeping. Keep the ring — atoms 1, 2, 3, 4, 5, 7 (C, N, C, C, C, N) — and
-    generate the rest: the two carbonyl oxygens (0, 6) and the four hydrogens
-    (8–11). Half the molecule given, half to place. The next cell builds
-    exactly that, with the atom indices drawn on so you can check them, and
-    leaves you four things to work with: `scaffold_batch` (the layout, in
-    uracil's atom order), `scaffold_model_fn` (the model bound to it), `x_kept`
-    (the ring coordinates, repeated per copy) and `free_atoms` (the mask of
-    rows a sampler may touch).
+    Ours is **uracil**. C₄H₄N₂O₂ is uracil's formula, so the RNA base is one of
+    our 181 isomers (index 7). Keep its six-membered ring — atoms 1, 2, 3, 4,
+    5, 7 — and generate the rest: the two carbonyl oxygens (0, 6) and the four
+    hydrogens (8–11). Half the molecule given, half to place.
 
-    Two axes carry the task, one each:
+    The next cell builds that, with the atom indices drawn on, and leaves you
+    four things: `scaffold_batch` (the layout, in uracil's atom order),
+    `scaffold_model_fn` (the model bound to it), `x_kept` (the ring
+    coordinates, repeated per copy) and `free_atoms` (the mask of rows a
+    sampler may touch).
+
+    Two axes carry the task, one each.
 
     **The prior.** §5 named it as an axis it does not vary — vary it here.
-    `GaussianPrior` draws every atom from
-    $\mathcal{N}(0, \sigma_\text{max}^2)$; a **scaffold prior** draws only the
-    *free* rows that way and puts the kept atoms at their given coordinates.
-    That is a legal prior, and the library's rule says why: an endpoint may
-    depend on anything known before generation — composition, atom count,
-    which atoms are fixed and where — but never on the data values of the batch
-    it is generating. So `ScaffoldPrior` subclasses `Prior` and is handed to
-    the sampler as its `prior=` argument, exactly like the process and the
-    parametrization.
+    `GaussianPrior` draws every atom from $\mathcal N(0, \sigma_\text{max}^2)$;
+    a **scaffold prior** draws only the *free* rows that way and puts the kept
+    atoms at their given coordinates. That is a legal prior, and the library's
+    rule says why: an endpoint may depend on anything known before generation —
+    composition, atom count, which atoms are fixed and where — but never on the
+    data values of the batch it is generating. So `ScaffoldPrior` subclasses
+    `Prior` and is handed to the sampler as `prior=`, exactly like the process
+    and the parametrization.
 
     **The sampler.** A prior only decides where the run *starts*; the first
     model call would move the ring like anything else. So freeze it: after
     every update write the scaffold coordinates back, and keep the noise
-    injection off those rows too. The free atoms see a ring that never moves,
-    and get pulled into place around it.
+    injection off those rows too. The free atoms then see a ring that never
+    moves, and get pulled into place around it.
 
-    Three `TODO`s, all in the cell after next. As shipped, the prior is an
-    ordinary Gaussian and nothing is frozen — so what you get is an
-    unconditional sample that ignores the ring, and the panels say **⚠ ring
-    moved**. Get all three right and that warning disappears: the ring stands
-    still through the whole movie while the oxygens and hydrogens fly in around
-    it.
+    **Three `# TODO`s in the cell after next.** As shipped, the prior is an
+    ordinary Gaussian and nothing is frozen, so you get an unconditional sample
+    that ignores the ring and panels that say **⚠ ring moved**. Get all three
+    right and that warning disappears: the ring stands still through the whole
+    movie while the oxygens and hydrogens fly in around it.
 
-    **Check your implementation against these questions:** did it rebuild
-    uracil (`O=c1cc[nH]c(=O)[nH]1`)? Several completions will be *other*
-    molecules on the same ring — enols, tautomers — which is worth deciding
-    about: failure, or the point? Then the honest worry: this start is
-    **out of distribution**. The model was trained on structures where every
-    atom carries the *same* noise level, and here six atoms are exact while six
-    sit 30 Å out. Does that show — and does starting the free atoms at a
-    smaller `std` (3 Å, say) buy better completions, or only less diverse ones?
-    Finally, freeze less: keep only the two ring nitrogens. How much of a
-    molecule does this model need before it can finish it?
+    **Then ask:**
+
+    - Did it rebuild uracil (`O=c1cc[nH]c(=O)[nH]1`)? Several completions will
+      be *other* molecules on the same ring — enols, tautomers. Failure, or the
+      point?
+    - This start is **out of distribution**: the model was trained where every
+      atom carries the *same* noise level, and here six atoms are exact while
+      six sit 30 Å out. Does that show — and does starting the free atoms at a
+      smaller `std` (3 Å, say) buy better completions, or only less diverse
+      ones?
+    - Freeze less: keep only the two ring nitrogens. How much of a molecule
+      does this model need before it can finish it?
     """)
     return
 
@@ -1506,8 +1487,9 @@ def _(DirectDenoisingSampler, torch):
             )
             # the same zero-COM frame everything else lives in, per molecule
             x = GaussianPrior.center(x, self.idx_m)
-            # TODO: the free rows start as noise, the scaffold rows start at
-            # the coordinates they are supposed to keep (`torch.where`)
+
+            # TODO (1 of 3) — the free rows start as noise, the scaffold rows
+            # start at the coordinates they are supposed to keep (`torch.where`)
             return x
 
     class ScaffoldDenoising(DirectDenoisingSampler):
@@ -1523,12 +1505,14 @@ def _(DirectDenoisingSampler, torch):
             for k in range(1, n_steps + 1):
                 noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
                 if noise_scale > 0.0:
-                    # TODO: the scaffold does not move, not even by the injection
+                    # TODO (2 of 3) — the scaffold must not move, not even by
+                    # the injection
                     x = x + noise_scale * torch.randn_like(x)
+
                 x0_hat = self.parametrization.to_x0(
                     self.process, model(x, t, cond), x, t
                 )
-                # TODO: only the free rows take the update
+                # TODO (3 of 3) — only the free rows take the update
                 x = x0_hat
             return x
     return ScaffoldDenoising, ScaffoldPrior
@@ -1601,19 +1585,20 @@ def _(mo):
     mo.md(r"""
     ## Where to go from here
 
-    Three things this tutorial skipped, all in the library. Of the five axes
-    only the *coupling* is left untouched — how the $(x_0, x_1)$ pairs are
-    matched up, and the slot flow matching with optimal transport plugs into;
-    it is a constructor argument exactly like the prior §8b replaced.
-    §7 assembled `Sampler` with one integrator and the default grid, and both
-    slots hold more: `Euler` and `Heun` integrate the reverse SDE or the
-    probability-flow ODE (`churn=0`) instead of stepping the exact posterior,
-    and a warped `grid` spends steps where the structure actually appears
-    rather than spreading them evenly — the usual first thing to tune when a
-    sampler needs to get cheaper. And the force-field side this tutorial rode
-    in on — property prediction, ML-driven molecular dynamics, and the
-    Lightning/CLI training stack — is covered by the SchNetPack documentation
-    and tutorials.
+    Three things this tutorial skipped, all in the library:
+
+    - Of the five axes only the **coupling** is left untouched — how the
+      $(x_0, x_1)$ pairs are matched up, and the slot flow matching with
+      optimal transport plugs into. A constructor argument exactly like the
+      prior §8b replaced.
+    - §7 assembled `Sampler` with one integrator and the default grid; both
+      slots hold more. `Euler` and `Heun` integrate the reverse SDE or the
+      probability-flow ODE (`churn=0`) instead of stepping the exact posterior,
+      and a warped `grid` spends steps where the structure actually appears —
+      the usual first thing to tune when a sampler needs to get cheaper.
+    - The force-field side this tutorial rode in on — property prediction,
+      ML-driven molecular dynamics, the Lightning/CLI training stack — is
+      covered by the SchNetPack documentation and tutorials.
     """)
     return
 

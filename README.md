@@ -11,13 +11,13 @@ starts — your own data in an ASE database, transforms, batches — and then
 builds a generative model out of the same pieces a machine-learned force field
 is made of: noising structures and computing labels as a dataloader transform
 (`Diffuse`), a `NeuralNetworkPotential` with a per-atom vector head, a plain
-PyTorch training loop, and two samplers — direct denoising and ancestral
-sampling — to generate new structures. Ends with two hands-on tasks, both
+PyTorch training loop, and two samplers — ancestral sampling and direct
+denoising — to generate new structures. Ends with two hands-on tasks, both
 steering a sampler without retraining the model: shape-guided direct denoising
 (generate at a prescribed ratio of principal-axis variances) and
 scaffold-conditioned generation (keep uracil's ring, generate the rest).
 
-The model is **GPFF** (Gaussian pseudo-force field), whose target is a pseudo
+The model is **GPFF** (generative pseudo-force field), whose target is a pseudo
 force — which makes it, structurally, an ordinary force field applied to noised
 structures, with no time conditioning anywhere.
 
@@ -65,16 +65,20 @@ marimo edit notebook.py     # interactive (recommended for the tutorial)
 marimo run notebook.py      # read-only app view
 ```
 
-No small checkpoint ships and none is written: the training cell *is* the
-run (~2 min on a GPU, ~15 on CPU), and re-running it trains again.
+The section-6 model ships as a checkpoint, so that cell loads it and the whole
+notebook runs in a couple of minutes. Set `RETRAIN = True` there to train it
+yourself instead — 12000 steps, ~15 min on a GPU and considerably longer on a
+CPU — which overwrites `checkpoints/gpff.pt` when it finishes.
 
-**Two models, deliberately.** Section 6 trains a teaching-sized network with
+**Two models, deliberately.** Section 6's is teaching-sized, trained with
 GPFF's recipe — geometric VE process over σ ∈ [0.05, 30] Å, log-normal
-σ-focused timestep sampling — and sections 7-8 sample with it by default. For
-comparison, section 7's `USE_BIG_MODEL` switch swaps in `gpff_big.pt`: the
-same target, process and training density at research scale (5.1M parameters,
-all of QM9), converted from the GPFF QM9 training run by
-`convert_gpff_seed999.py` (a dev script, not shipped).
+σ-focused timestep sampling — on the 181 isomers, and section 7 samples with it
+by default. For comparison, section 7's `USE_BIG_MODEL` switch swaps in
+`gpff_big.pt`: the same target, process and training density at research scale
+(5.1M parameters, all of QM9), converted from the GPFF QM9 training run by
+`convert_gpff_seed999.py` (a dev script, not shipped). Section 8's two tasks
+always use the research-scale model, whatever that switch says — steering a
+sampler is only legible when the model underneath is not the bottleneck.
 
 ## Colab
 

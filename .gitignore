@@ -35,3 +35,7 @@ __marimo__/
 # Instructor check for the section-8 tasks (runs solutions.py against the
 # shipped runner cells). Same rule: stays on disk.
 check_solutions.py
+
+# Locally executed copy with outputs baked in (~6 MB); notebook.ipynb stays
+# the clean generated file.
+notebook.executed.ipynb
