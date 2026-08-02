@@ -65,8 +65,8 @@ No small checkpoint ships and none is written: the training cell *is* the
 run (~2 min on a GPU, ~15 on CPU), and re-running it trains again.
 
 **Two models, deliberately.** Section 6 trains a teaching-sized network with
-GPFF's recipe — linear VE process to σ_max = 10 Å, log-normal σ-focused
-timestep sampling — and sections 7-8 sample with it by default. For
+GPFF's recipe — geometric VE process over σ ∈ [0.05, 30] Å, log-normal
+σ-focused timestep sampling — and sections 7-8 sample with it by default. For
 comparison, section 7's `USE_BIG_MODEL` switch swaps in `gpff_big.pt`: the
 same target, process and training density at research scale (5.1M parameters,
 all of QM9), converted from the GPFF QM9 training run by

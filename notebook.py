@@ -261,35 +261,32 @@ def _(mo):
     - **`VP`** (variance preserving — the DDPM family): the data is scaled
       away ($a \to 0$) while noise of fixed scale blends in; the total
       variance stays constant.
-    - **`VE`** (variance exploding): the data is never scaled ($a \equiv 1$);
-      noise is *added* until it drowns the structure. The library ships two
-      ramps: classic score matching's geometric one (`VE`) and the straight
-      one (`VELinear`) — $\sigma(t) = t\,\sigma_\text{max}$, the EDM/GPFF
-      geometry — which is what we use. The noise scale is the **prior's**:
-      $\sigma_\text{max}$ must match the data scale — rule of thumb: the
-      largest pairwise distance, ~7.7 Å here, so we take **10 Å**. Too small
-      and the endpoint still remembers the data; too large and training wastes
-      capacity — and *neither failure is loud*.
+    - **`VE`** (variance exploding — score matching): the data is never scaled
+      ($a \equiv 1$); noise whose scale grows geometrically from
+      $\sigma_\text{min}$ to $\sigma_\text{max}$ is *added* until it drowns
+      the structure. $\sigma_\text{max}$ must at least match the data scale —
+      rule of thumb: the largest pairwise distance, ~7.7 Å here. Too small and
+      the endpoint still remembers the data; too large and training wastes
+      capacity — and *neither failure is loud*. We take **30 Å**, which is
+      what the ready-trained generation model of §7 uses: staying on one
+      process keeps every model in this notebook interchangeable.
 
     For all illustrations we use a single molecule: an elongated, open-chain
     isomer whose shape is easy to track through the noise. Below, that chain
     under both processes with the same underlying noise draw (slider = $t$):
     VP shrinks it into a small fixed-size cloud, VE leaves it in place and
-    buries it under a 10 Å one.
+    buries it under a 30 Å one.
     """)
     return
 
 
 @app.cell
 def _(AtomsLoader, batch, dataset, properties, torch, viz):
-    from schnetpack.generative import VP, GaussianPrior, VELinear
+    from schnetpack.generative import VE, VP
 
-    # the process every later section shares. The prior carries the scale —
-    # 10 Å, the data's own — and GPFF's endpoint convention: a plain iid
-    # Gaussian, not re-centered per molecule.
-    process = VELinear(
-        t_min=0.0, t_max=1.0, prior=GaussianPrior(std=10.0, centered=False)
-    )
+    # the process every later section shares
+    SIGMA_MIN, SIGMA_MAX = 0.05, 30.0  # as the §7 generation model was trained
+    process = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
 
     CHAIN_IDX = 90  # the most elongated open-chain isomer of the dataset
@@ -315,7 +312,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
         ghost_id=0,
         panel_labels=("x₀ (data)", "xₜ", "x₁ (prior)"),
     )
-    return chain, process, x0
+    return SIGMA_MIN, chain, process, x0
 
 
 @app.cell
@@ -408,24 +405,33 @@ def _(mo):
     time, noises the positions, and writes the label into the item dict.
 
     *Where along the path* those draws land is its own choice — the **time
-    sampler**. Uniform $t$ on our linear schedule spreads samples evenly over
-    $\sigma \in [0, 30]$ Å, spending most of the budget deep in the noise,
-    where the target is nearly the endpoint itself and there is little to
-    learn. `LogNormalSigmaTimes` states the density where the statement means
-    something — in $\sigma$: $\log\sigma \sim \mathcal N(-0.7,\, 1.2^2)$, a
-    median of ~0.5 Å with most of the mass between 0.15 and 1.7 Å — exactly
-    the band where bonds live and denoising is genuinely hard.
-    `truncate=True` redraws the occasional sample beyond $\sigma_\text{max}$
-    instead of piling it onto the boundary. This is GPFF's own training
-    density (and EDM's, for images).
+    sampler**. Uniform $t$ on a geometric schedule is *log-uniform* in
+    $\sigma$: equal weight to every decade from 0.05 to 30 Å, so over a third
+    of the budget goes above 3 Å, where the target is nearly the endpoint
+    itself and there is little to learn. `LogNormalSigmaTimes` states the density
+    where the statement means something — in $\sigma$:
+    $\log\sigma \sim \mathcal N(-0.7,\, 1.2^2)$, a median of ~0.5 Å with most
+    of the mass between 0.15 and 1.7 Å — exactly the band where bonds live and
+    denoising is genuinely hard. `truncate=True` redraws the few samples that
+    land outside the schedule's range instead of piling them onto its ends.
+    This is GPFF's own training density (and EDM's, for images).
+
+    The process does the converting, through `t_of_sigma`. Here that map is
+    closed-form and the arithmetic is pretty: on a geometric schedule $t$ is
+    *affine* in $\log\sigma$, so a log-normal over $\sigma$ is exactly a
+    normal over $t$ — $t \sim \mathcal N(0.36,\, 0.19^2)$ for these numbers.
 
     Only the transform order needs thought:
 
-    1. `SubtractCenterOfGeometry` — diffusion lives in the centered frame;
+    1. `SubtractCenterOfGeometry` — diffusion lives in the centered frame,
+       and the prior draws its endpoints there too (`GaussianPrior` centers
+       per molecule by default): a translation-invariant network could never
+       predict a displacement of a whole structure, so an off-center endpoint
+       would be unlearnable noise in every label;
     2. `Diffuse` — overwrites `R` with $x_t$, writes the label
        `"pseudo_force"` and the time `"t"`;
     3. `MatScipyNeighborList` — **after** noising, with a cutoff sized for
-       *noised* structures (30 Å, not the ~7 Å the clean molecules span);
+       *noised* structures (150 Å — a fully noised cloud is ~90 Å across);
     4. `CastTo32`.
 
     An ordinary MSE against `"pseudo_force"` is then the whole training
@@ -438,7 +444,7 @@ def _(mo):
 def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
     from schnetpack.generative import Diffuse, LogNormalSigmaTimes
 
-    CUTOFF = 30.0  # must cover *noised* structures, not just clean ones
+    CUTOFF = 150.0  # must cover *noised* structures — clouds ~90 Å across
 
     # train mostly around half an Ångström of displacement — GPFF's density
     t_sampler = LogNormalSigmaTimes(process, mean=-0.7, std=1.2, truncate=True)
@@ -474,7 +480,8 @@ def _(mo):
     Those batches *are* the training set of our generative model — so look at
     one. Below, ten structures drawn from the same loader: each at its own
     randomly drawn time, captioned with its noise level, with the
-    **pseudo-force label drawn as an arrow on every atom**.
+    **pseudo-force label drawn as an arrow on every atom** — again at half
+    length, $F/2$, so each arrow ends where its atom belongs.
 
     Read it as a difficulty gradient. At $\sigma \lesssim 0.5$ Å the molecule
     is intact and the arrows are tiny corrections; at $\sigma$ of several
@@ -494,7 +501,8 @@ def _(peek, process, properties, viz):
     viz.show_trajectory(
         [peek[properties.R]],
         peek,
-        vectors=[peek["pseudo_force"]],
+        # F/2 = x0 - x_t, so each arrow ends on the clean structure
+        vectors=[peek["pseudo_force"] / 2],
         titles=[f"σ = {float(s):.2f} Å" for s in sigma_peek],
         cell_px=170,
         zoom=1.0,
@@ -530,8 +538,8 @@ def _(mo):
        features and predicts a 3-vector per atom. (An energy model would end
        in `Atomwise` instead: a scalar per atom, summed per molecule.)
 
-    The cutoff is 30 Å because this force field sees *noised* structures,
-    whose atoms are tens of Ångström apart.
+    The cutoff is 150 Å because this force field sees *noised* structures — a
+    fully noised cloud is ~90 Å across.
     """)
     return
 
@@ -667,11 +675,11 @@ def _(mo):
     four minutes of training.
 
     For comparison the bundle also ships `checkpoints/gpff_big.pt`: a GPFF
-    trained the same way — same pseudo-force target, same linear process,
-    same $\sigma$-focused time sampling — but at research scale: **5.1M
+    trained the same way — same pseudo-force target, same VE process, same
+    $\sigma$-focused time sampling — but at research scale: **5.1M
     parameters, trained on all ~130k molecules of QM9**. The assembly below is
-    the same `NeuralNetworkPotential` of §6 with bigger numbers in it (its own
-    150 Å cutoff among them, a property of that run rather than a choice), and
+    the same `NeuralNetworkPotential` of §6 — same process, same cutoff — with
+    bigger numbers in it, and
     `USE_BIG_MODEL` swaps it into every sampling and validation cell that
     follows. Flip it after one pass through §7: how far the numbers move is
     the most honest measure of what scale buys.
@@ -682,6 +690,7 @@ def _(mo):
 @app.cell
 def _(
     AtomwiseVector,
+    CUTOFF,
     DEVICE,
     HERE,
     NeuralNetworkPotential,
@@ -691,14 +700,12 @@ def _(
     snn,
     torch,
 ):
-    BIG_CUTOFF = 150.0  # this run's own; its radial basis is built for it
-
     big_net = NeuralNetworkPotential(
         representation=PaiNN(
             n_atom_basis=256,
             n_interactions=4,
-            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=BIG_CUTOFF),
-            cutoff_fn=snn.CosineCutoff(BIG_CUTOFF),
+            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=CUTOFF),
+            cutoff_fn=snn.CosineCutoff(CUTOFF),
             norm_epsilon=1.0,  # this run normalized pair directions as r / (d + 1)
         ),
         input_modules=[PairwiseDistances()],
@@ -745,7 +752,7 @@ def _(mo):
 
     | part | what it decides | here |
     |---|---|---|
-    | `process` | the noise schedule $\sigma(t)$ | the `VELinear` of §5 |
+    | `process` | the noise schedule $\sigma(t)$ | the `VE` of §5 |
     | `parametrization` | what the network's output means | pseudo force |
     | `integrator` | how one step down the ladder is taken | `Ancestral` |
     | `grid` | where the rungs sit | uniform in $t$ (the default) |
@@ -754,11 +761,11 @@ def _(mo):
     estimate $\hat x_0$, then draws from the closed-form Gaussian for
     $x_{\sigma_{k-1}}$ given $x_{\sigma_k}$ and $\hat x_0$ — no approximation
     beyond the model's own error. On a VE-family process that reduces to the
-    familiar score-form update. On our linear schedule the default uniform
-    grid descends $\sigma$ in equal ~0.15 Å rungs; classic score matching
-    prefers a *geometric* ladder — more rungs where $\sigma$ is small — and
-    the `grid` slot is where such a warp would go (see the outro), one more
-    axis this assembly leaves open.
+    familiar score-form update. And because VE's $\sigma$ grows
+    *geometrically* in $t$, a uniform grid already gives the geometric ladder
+    score matching wants — rungs that bunch up where $\sigma$ is small — so no
+    schedule code is needed. (Warping the grid is still an option, and the
+    `grid` slot is where it would go; see the outro.)
 
     Two pieces of glue from `helpers.py`. `fully_connected_batch` lays out 8
     copies of our composition as one flat batch — the topology the model needs
@@ -777,12 +784,11 @@ def _(mo):
     each one sits on, $t = 1$ down to $0$: the ladder comes down *gradually*,
     and the structure only appears over the last handful of rungs.
 
-    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 10$ Å, so
-    the starting cloud is tens of Ångström across against a ~3 Å molecule — a
-    range no single camera can hold. The view is framed on the finished
-    structure and pulled back (`zoom=0.35`), so the earliest frames spill past
-    the edges and the atoms fly in from outside. That gap *is* the scale the
-    model closes.
+    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 30$ Å, so
+    the starting cloud is ~80 Å across against a ~3 Å molecule — a 25× range no
+    single camera can hold. The view is framed on the finished structure and
+    pulled back (`zoom=0.35`), so the earliest frames spill past the edges and
+    the atoms fly in from outside. That gap *is* the scale the model closes.
     """)
     return
 
@@ -812,7 +818,7 @@ def _(
     n_total = int(sampling_batch[properties.n_atoms].sum())
 
     # process + parametrization as before, plus the two sampling-only parts;
-    # `grid` is left at its default (uniform in t = evenly spaced sigma here)
+    # `grid` is left at its default (uniform in t = geometric in sigma on VE)
     ancestral = Sampler(process, force_param, integrator=Ancestral())
 
     # the sampler returns the final structure only; wrapping the model keeps
@@ -898,7 +904,7 @@ def _(
     torch.manual_seed(2)
     direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=0.0)
 
-    # draw the start from the prior — a 10 Å cloud per molecule — then run
+    # draw the start from the prior — a 30 Å cloud per molecule — then run
     # the denoising loop
     x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
 
@@ -1056,8 +1062,8 @@ def _(mo):
     1. predict the pseudo force $F$ for the current structures;
     2. estimate each molecule's noise level $\hat\sigma_m$ from $F$;
     3. direct-denoise: $\hat x_0 = x + F/2$;
-    4. if $\max_m \hat\sigma_m \le \sigma_\text{stop}$ (0.05 Å here — roughly
-       where geometry is settled): stop, return $\hat x_0$;
+    4. if $\max_m \hat\sigma_m \le \sigma_\text{min}$ (the schedule's own
+       floor, 0.05 Å): stop, return $\hat x_0$;
     5. otherwise re-noise a *shrunken* amount onto the estimate,
        $x \leftarrow \hat x_0 + \kappa\,\hat\sigma_m\,\varepsilon$ with
        $\varepsilon \sim \mathcal N(0, I)$, $\kappa \approx 0.7$ — and go to 1.
@@ -1075,7 +1081,7 @@ def _(mo):
     ```python
     class VarianceConditionedDenoising(DirectDenoisingSampler):
         def __init__(self, process, parametrization, idx_m, n_atoms,
-                     shrink=0.7, sigma_stop=0.05, **kwargs):
+                     shrink=0.7, sigma_stop=SIGMA_MIN, **kwargs):
             super().__init__(process, parametrization, **kwargs)
             ...
 
@@ -1103,6 +1109,7 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
+    SIGMA_MIN,
     force_param,
     model_fn,
     plt,
@@ -1125,7 +1132,7 @@ def _(
             idx_m,
             n_atoms,
             shrink=0.7,
-            sigma_stop=0.05,
+            sigma_stop=SIGMA_MIN,
             **kwargs,
         ):
             super().__init__(process, parametrization, **kwargs)
@@ -1180,7 +1187,7 @@ def _(
 
         fig, ax = plt.subplots(figsize=(5.5, 3.2))
         ax.semilogy(torch.stack(vcd.sigma_track).cpu().numpy(), alpha=0.8)
-        ax.axhline(0.05, color="k", ls=":", lw=1)
+        ax.axhline(SIGMA_MIN, color="k", ls=":", lw=1)
         ax.set_xlabel("iteration (= model calls)")
         ax.set_ylabel(r"estimated $\hat\sigma_m$ [Å]")
         ax.set_title(
