@@ -745,9 +745,9 @@ def _(mo):
     rather than a still. A sampler returns the structure it ended on and
     nothing else — but every step passes its state through the model, so
     wrapping the model captures the whole run without the sampler knowing.
-    Scrub the slider: the cloud collapses within the first two or three model
-    calls, and everything after that is the structure being tidied up. The
-    panel on the right is the frame it finishes on.
+    One box per molecule, as before — they just move now. Scrub the slider: the
+    cloud collapses within the first two or three model calls, and everything
+    after that is the structure being tidied up; the last frame is the sample.
 
     One thing to expect on frame 0. The prior is $\sigma_\text{max} = 30$ Å, so
     the starting cloud is ~80 Å across against a ~3 Å molecule — a 25× range no
@@ -794,14 +794,7 @@ def _(
 
     # zoom < 1 pulls the camera back: it frames the final molecule, and the
     # first frames are a 90 Å-wide cloud that should not fly off the panel
-    viz.show_trajectory(
-        direct_frames,
-        sampling_batch,
-        end=True,
-        panel_labels=("", "denoising", "sample x̂₀"),
-        zoom=0.35,
-        cell_px=170,
-    )
+    viz.show_trajectory(direct_frames, sampling_batch, zoom=0.35, cell_px=170)
     return model_fn, n_total, sampling_batch, x_direct
 
 
@@ -894,8 +887,6 @@ def _(
         ancestral_frames,
         sampling_batch,
         times=ladder_t.tolist(),
-        end=True,
-        panel_labels=("", "walking the ladder", "sample x̂₀"),
         zoom=0.35,
         cell_px=170,
         frame_ms=120,  # 65 frames — play them faster than the default
@@ -1181,12 +1172,7 @@ def _(
         ax.grid(alpha=0.3, which="both")
         # one animated box per molecule; the σ̂ story is the plot above
         viewer = viz.show_trajectory(
-            vcd.frames,
-            sampling_batch,
-            end=True,
-            panel_labels=("", "self-paced descent", "sample x̂₀"),
-            zoom=0.35,
-            cell_px=170,
+            vcd.frames, sampling_batch, zoom=0.35, cell_px=170
         )
         return fig, viewer
 
