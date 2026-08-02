@@ -27,15 +27,12 @@ def _():
 
     import viz as _viz
 
-    # one run of §7's direct-denoising sampler, rendered ahead of time by the
-    # same viewer every section below uses
+    # a still of §7's direct-denoising sampler, taken from the same viewer
+    # every section below uses
     _here = (
         _os.path.dirname(_os.path.abspath(__file__)) if "__file__" in globals() else "."
     )
-    with open(_os.path.join(_here, "assets", "denoising.html"), encoding="utf-8") as _fh:
-        _page = _fh.read()
-
-    _viz.show_page(_page, height=210)
+    _viz.show_image(_os.path.join(_here, "assets", "denoising.png"), width=760)
     return
 
 
@@ -45,10 +42,10 @@ def _(mo):
     - **Context.** Niklas Gebauer's talk covered the theory of generative
       models for molecules. This session is its practical counterpart: the
       code that turns that theory into a model you can train and sample from.
-    - **What we build.** GPFF — the generative pseudo-force field — trained
-      twice: on a **181-molecule slice of QM9**, small enough to train live in
-      this notebook, and, shipped as a checkpoint, on **all of QM9** at
-      research scale.
+    - **What we build.** A **Generative Pseudo-Force Field (GPFF)**, trained on
+      **QM9** — a 181-molecule slice of it here, small enough to train live in
+      this notebook, with a research-scale checkpoint on all of QM9 to sample
+      from.
     - **Scope.** We generate **equilibrium structures only** — the 3D geometry.
       The composition is given: positions diffuse, **atom types do not**.
     - **The code.** This is the **work-in-progress `schnetpack.generative`

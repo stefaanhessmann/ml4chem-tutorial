@@ -824,6 +824,32 @@ def figure_html(fig, dpi: int = 110) -> str:
     return f'<img src="data:image/png;base64,{data}" style="max-width:100%;">'
 
 
+def image_html(path: str, width: Optional[int] = None) -> str:
+    """A PNG on disk as a self-contained ``<img>``, like :func:`figure_html`.
+
+    Inlined rather than linked, so a notebook exported with its outputs carries
+    the picture with it.
+    """
+    with open(path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode()
+    size = f"width:{int(width)}px;" if width else ""
+    return f'<img src="data:image/png;base64,{data}" style="max-width:100%;{size}">'
+
+
+def show_image(path: str, width: Optional[int] = None):
+    """A PNG on disk, on screen — the still counterpart to the viewers above."""
+    html = image_html(path, width)
+    if _in_marimo():
+        import marimo as mo
+
+        return mo.Html(html)
+    try:
+        from IPython.display import HTML
+    except ImportError:
+        return html
+    return HTML(html)
+
+
 def _as_html(part, height: int) -> str:
     if hasattr(part, "savefig"):  # a matplotlib figure
         return figure_html(part)
@@ -883,15 +909,6 @@ def show_frames(trajectory, batch: dict, height: Optional[int] = None, **kwargs)
 def _n_rows(trajectory, batch: dict) -> int:
     n_runs = len(trajectory) if isinstance(trajectory, dict) else 1
     return n_runs * int(_numpy(batch[properties.n_atoms]).shape[0])
-
-
-def show_page(html: str, height: int = 300):
-    """Put an already-built page on screen — one saved earlier by :func:`export_html`.
-
-    The pages above are self-contained, so a trajectory can be rendered once,
-    written to a file, and shown later without re-running what produced it.
-    """
-    return _embed(html, 1, 2, 0, height)
 
 
 def export_html(html: str, path: str) -> str:
