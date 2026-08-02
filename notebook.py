@@ -136,32 +136,28 @@ def _(mo):
       on the command line. This notebook builds its loop by hand instead, to
       keep every part visible.
 
+    **SchNetPack 3, what we are adding:**
+
+    - **Generative models.** A force field *evaluates* structures it is given;
+      a generative model *produces* them, learning the distribution behind a
+      dataset's geometries so new, plausible ones can be drawn from it.
+    - **`schnetpack.generative`** makes **diffusion-based** generative models a
+      first-class part of the toolbox: the **forward process** (noise
+      schedules, parametrizations, priors and couplings, assembled from
+      swappable pieces) and the **samplers** that run a trained model backwards
+      from noise to structure.
+    - **More of the same to come**, built from those interfaces: **flow
+      matching**, further processes and further samplers.
+
     ### How generative models fit in
 
-    - **What is new.** A force field *evaluates* structures it is given; a
-      **generative model** *produces* them, learning the distribution behind a
-      dataset's geometries so new, plausible ones can be drawn from it.
-    - **What SchNetPack 3 adds.** `schnetpack.generative` makes
-      **diffusion-based generative models** a first-class part of the toolbox:
-      the **forward process** (noise schedules, parametrizations, priors and
-      couplings, assembled from swappable pieces), the **samplers** that run a
-      trained model backwards from noise to structure, and, from the same
-      interfaces, **flow matching** and further processes and samplers as the
-      module grows.
-    - **Other families exist.** **Autoregressive** models place one atom at a
-      time, conditioned on those already placed, and **G-SchNet** is that
-      approach built on SchNet. SchNetPack 3 implements the diffusion-based
-      family, and this tutorial stays inside it.
-    - **GPFF makes the kinship explicit.** Diffusion models are close relatives
-      of MLFFs, and a Generative Pseudo-Force Field says so outright: what it
-      learns *is* a force, one pointing every atom back toward the clean
-      structure rather than downhill in energy.
-    - **So the same architectures serve both.** A denoiser reads a structure
-      and predicts a 3-vector per atom, which is what an MLFF does. GPFF
-      therefore reuses the *same architectures* (here PaiNN), the *same
-      datasets and transform pipeline*, and the *same training loop*. What is
-      genuinely new is only the forward process that manufactures the training
-      data and the sampler that runs the model backwards.
+    - **A denoiser is an MLFF.** It reads a structure and predicts a 3-vector
+      per atom, and GPFF makes the kinship literal: what it learns *is* a
+      force, one pointing every atom back toward the clean structure rather
+      than downhill in energy.
+    - **So everything else is reused**: the same architectures, the same
+      datasets and transform pipeline, the same training loop. Only the forward
+      process and the sampler are new.
     """)
     return
 
