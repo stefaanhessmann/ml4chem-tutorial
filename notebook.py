@@ -149,7 +149,7 @@ def _():
             ],
         )
     f"{len(molecules)} × {molecules[0].get_chemical_formula()} → {DB_PATH} · running on {DEVICE}"
-    return ASEAtomsData, AtomsLoader, DB_PATH, DEVICE, HERE, numbers, os, torch
+    return ASEAtomsData, AtomsLoader, DB_PATH, DEVICE, HERE, np, numbers, os, torch
 
 
 @app.cell
@@ -1360,6 +1360,53 @@ def _(
 @app.cell
 def _(mo):
     mo.md(r"""
+    <details>
+    <summary>🔑 <b>Reference solution</b> — try it yourself first</summary>
+
+    Both `# TODO`s, filled in. Paste over the ones in the cell above; the names
+    are the same, so the runner picks it up on the next execution.
+
+    ```python
+    def reshape(self, x):
+        target = self.target.to(x.device, x.dtype)
+        out = x.clone()
+        for m in range(self.n_mol):
+            rows = self.idx_m == m
+            pos = x[rows]
+            pos = pos - pos.mean(0)                      # each molecule on its own center
+            lam, axes = torch.linalg.eigh(pos.T @ pos / len(pos))
+            lam, axes = lam.flip(0), axes.flip(1)        # ascending -> descending
+            # sum(target) == 1, so these variances still add up to tr C
+            scale = (target * lam.sum() / lam.clamp(min=1e-8)).sqrt()
+            # rotate into the principal frame, scale there, rotate back
+            out[rows] = ((pos @ axes) * scale) @ axes.T
+        return out
+
+    def denoise(self, model, x_t, n_steps, cond=None):
+        x = x_t
+        t = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        for k in range(1, n_steps + 1):
+            noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
+            if noise_scale > 0.0:
+                x = x + noise_scale * torch.randn_like(x)
+            x = self.reshape(x)          # <- the state the model sees has the target shape
+            x = self.parametrization.to_x0(self.process, model(x, t, cond), x, t)
+        return x
+    ```
+
+    `eigh` returns its eigenvalues *ascending* and the matching axes as the
+    columns of `axes`, which is why both get flipped: `self.target` was sorted
+    descending in `__init__`, and the two orders have to line up or the
+    guidance stretches the wrong axis.
+
+    </details>
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ### b) Scaffold-conditioned generation
 
     Fix part of a molecule, generate the rest. This is the question generative
@@ -1367,16 +1414,21 @@ def _(mo):
     — a ring that binds, a core a synthesis route exists for — and what is
     wanted is everything around it.
 
-    Ours is **uracil**. C₄H₄N₂O₂ is uracil's formula, so the RNA base is one of
-    our 181 isomers (index 7). Keep its six-membered ring — atoms 1, 2, 3, 4,
-    5, 7 — and generate the rest: the two carbonyl oxygens (0, 6) and the four
-    hydrogens (8–11). Half the molecule given, half to place.
+    Ours is **3-aminopyridine** — a pyridine ring carrying an amine, and one of
+    medicinal chemistry's most-used cores. Keep the ring, atoms **1–6**
+    (C, C, N, C, C, C), and generate everything else: the amine nitrogen (0),
+    its two hydrogens, and the four ring hydrogens — **7 of 13 atoms free**.
 
-    The next cell builds that, with the atom indices drawn on, and leaves you
-    four things: `scaffold_batch` (the layout, in uracil's atom order),
-    `scaffold_model_fn` (the model bound to it), `x_kept` (the ring
-    coordinates, repeated per copy) and `free_atoms` (the mask of rows a
-    sampler may touch).
+    It comes from QM9 rather than from our 181 isomers, so the next cell simply
+    *states* it: three arrays, positions in Å and already centered, atomic
+    numbers, and the indices to keep. That is all a scaffold is. It works
+    because §8 samples with the model trained on all of QM9, which knows this
+    composition even though §3's dataset never mentions it.
+
+    That cell also draws the molecule with its atom indices on, and leaves you
+    four things: `scaffold_batch` (the layout, in this molecule's atom order),
+    `scaffold_model_fn` (the model bound to it), `x_kept` (the coordinates,
+    repeated per copy) and `free_atoms` (the mask of rows a sampler may touch).
 
     Two axes carry the task, one each.
 
@@ -1400,19 +1452,20 @@ def _(mo):
     ordinary Gaussian and nothing is frozen, so you get an unconditional sample
     that ignores the ring and panels that say **⚠ ring moved**. Get all three
     right and that warning disappears: the ring stands still through the whole
-    movie while the oxygens and hydrogens fly in around it.
+    movie while the amine and the hydrogens fly in around it.
 
     **Then ask:**
 
-    - Did it rebuild uracil (`O=c1cc[nH]c(=O)[nH]1`)? Several completions will
-      be *other* molecules on the same ring — enols, tautomers. Failure, or the
-      point?
+    - Did it rebuild 3-aminopyridine (`Nc1cccnc1`)? Read the panel captions:
+      most completions put the amine on a *different* ring carbon — 2-amino
+      (`Nc1ccccn1`) and 4-amino (`Nc1ccncc1`) are the same seven atoms on the
+      same fixed core. Failure, or exactly what a scaffold is for?
     - This start is **out of distribution**: the model was trained where every
       atom carries the *same* noise level, and here six atoms are exact while
-      six sit 30 Å out. Does that show — and does starting the free atoms at a
-      smaller `std` (3 Å, say) buy better completions, or only less diverse
+      seven sit 30 Å out. Does that show — and does starting the free atoms at
+      a smaller `std` (3 Å, say) buy better completions, or only less diverse
       ones?
-    - Freeze less: keep only the two ring nitrogens. How much of a molecule
+    - Freeze less: keep only three of the ring atoms. How much of a molecule
       does this model need before it can finish it?
     """)
     return
@@ -1420,39 +1473,59 @@ def _(mo):
 
 @app.cell
 def _(
-    AtomsLoader,
     DEVICE,
     big_model,
-    dataset,
     fully_connected_batch,
     make_model_fn,
+    np,
     properties,
     to_device,
     torch,
     viz,
 ):
-    URACIL_IDX = 7  # C4H4N2O2 is uracil's formula — the RNA base is in the set
-    RING = [1, 2, 3, 4, 5, 7]  # its six-membered ring, in this molecule's order
+    # 3-aminopyridine, one QM9 structure written out in full: nothing here
+    # needs the dataset, and a scaffold is only ever these three arrays.
+    SCAFFOLD_Z = np.array([7, 6, 6, 7, 6, 6, 6, 1, 1, 1, 1, 1, 1])
+    SCAFFOLD_R = np.array(  # positions in Angstrom, center of geometry at 0
+        [
+            [-0.16519, 2.17619, 0.16620],  # 0  N, the amine
+            [-0.13138, 0.78742, 0.06460],  # 1  C, ring, carries it
+            [-1.31683, 0.03404, 0.04390],  # 2  C, ring
+            [-1.35807, -1.29393, 0.00680],  # 3  N, ring
+            [-0.19797, -1.95657, -0.01366],  # 4  C, ring
+            [1.03519, -1.31109, -0.00004],  # 5  C, ring
+            [1.07267, 0.07604, 0.03904],  # 6  C, ring
+            [0.64523, 2.65276, -0.20172],  # 7  H, on the amine
+            [-1.02265, 2.60413, -0.15223],  # 8  H, on the amine
+            [-2.27658, 0.55041, 0.06012],  # 9  H, on C2
+            [-0.25897, -3.04086, -0.04435],  # 10 H, on C4
+            [1.95467, -1.88629, -0.02177],  # 11 H, on C5
+            [2.01987, 0.60775, 0.05311],  # 12 H, on C6
+        ]
+    )
+    SCAFFOLD = np.array([1, 2, 3, 4, 5, 6])  # the ring — what stays put
     N_SCAFFOLD = 10  # completions to generate
 
-    uracil = next(iter(AtomsLoader(dataset, sampler=[URACIL_IDX])))
-    # the layout has to follow *this* molecule's atom order — the isomers share
-    # a composition, not an ordering
     scaffold_batch = to_device(
-        fully_connected_batch(uracil[properties.Z].tolist(), n_mol=N_SCAFFOLD), DEVICE
+        fully_connected_batch(SCAFFOLD_Z.tolist(), n_mol=N_SCAFFOLD), DEVICE
     )
     scaffold_model_fn = make_model_fn(big_model, scaffold_batch, "pseudo_force_pred")
 
-    # the same ring in every copy, at the dataset's (centered) coordinates...
-    x_kept = uracil[properties.R].repeat(N_SCAFFOLD, 1).to(DEVICE)
+    # the same ring in every copy...
+    x_kept = (
+        torch.tensor(SCAFFOLD_R, dtype=torch.float32).repeat(N_SCAFFOLD, 1).to(DEVICE)
+    )
     # ...and the mask of rows a sampler is allowed to touch
-    kept = torch.zeros(int(uracil[properties.n_atoms]), dtype=torch.bool)
-    kept[RING] = True
+    kept = torch.zeros(len(SCAFFOLD_Z), dtype=torch.bool)
+    kept[torch.as_tensor(SCAFFOLD)] = True
     free_atoms = (~kept).repeat(N_SCAFFOLD).to(DEVICE)
 
+    # the same arrays as one molecule, only to look at
+    scaffold_view = fully_connected_batch(SCAFFOLD_Z.tolist(), n_mol=1)
+    scaffold_view[properties.R] = torch.tensor(SCAFFOLD_R, dtype=torch.float32)
     viz.show_batch(
-        uracil,
-        titles=["uracil — keep 1,2,3,4,5,7; generate 0,6 and 8–11"],
+        scaffold_view,
+        titles=["3-aminopyridine — keep the ring 1–6; generate 0 and 7–12"],
         atom_index=True,
         cell_px=300,
         zoom=1.5,
@@ -1577,6 +1650,52 @@ def _(
         cell_px=190,
         frame_ms=120,
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    <details>
+    <summary>🔑 <b>Reference solution</b> — try it yourself first</summary>
+
+    All three `# TODO`s. Same names as the cell above, so the runner picks them
+    up as soon as you re-execute.
+
+    ```python
+    # in ScaffoldPrior
+    def sample(self, shape, dtype=None, device=None, context=None):
+        x = self.std * torch.randn(
+            *shape,
+            dtype=dtype or self.x_scaffold.dtype,
+            device=device or self.x_scaffold.device,
+        )
+        x = GaussianPrior.center(x, self.idx_m)
+        return torch.where(self.free, x, self.x_scaffold)
+
+    # in ScaffoldDenoising
+    def denoise(self, model, x_t, n_steps, cond=None):
+        x = torch.where(self.free, x_t, self.x_scaffold)      # pin, then start
+        t = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        for k in range(1, n_steps + 1):
+            noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
+            if noise_scale > 0.0:
+                # the scaffold does not move, not even by the injection
+                x = x + noise_scale * torch.randn_like(x) * self.free
+            x0_hat = self.parametrization.to_x0(self.process, model(x, t, cond), x, t)
+            x = torch.where(self.free, x0_hat, self.x_scaffold)   # only free rows
+        return x
+    ```
+
+    `self.free` is stored as `free[:, None]`, shape `(n_atoms, 1)`, so every
+    `torch.where` and the masked injection broadcast across x, y and z on their
+    own. The first line of `denoise` matters as much as the last: the prior
+    already places the scaffold, but a student's `x_t` need not, and pinning
+    once at the start makes the loop's invariant true from the first model
+    call.
+
+    </details>
+    """)
     return
 
 
