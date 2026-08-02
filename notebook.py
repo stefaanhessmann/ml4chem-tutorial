@@ -56,7 +56,8 @@ def _(mo):
     2. **Introduction**: SchNetPack today, and where GPFF plugs in
     3. **Your own data**: databases, transforms, batches
     4. **Roadmap**: the three parts of a diffusion model
-    5. **Forward process**: noising structures, defining labels
+    5. **Forward process**: noising as data augmentation, and the labels it
+       writes
     6. **Model and training**: a force field on noised structures
     7. **Sampling**: ancestral, direct denoising, validation
     8. **Your tasks**: steering the sampler
@@ -291,13 +292,14 @@ def _(mo):
     In code, a diffusion-based generative model is **three parts**, and each
     gets one section:
 
-    | | part | what it is | where |
-    |---|---|---|---|
-    | a | **forward process** | noising structures and computing labels, inside the dataloader | §5 |
-    | b | **model architecture** | an MLFF-shaped network applied to noised structures | §6 |
-    | c | **sampling** | iterating the trained model from noise to structures | §7 |
+    - **I. Forward process** (§5): noising structures and computing labels,
+      inside the dataloader.
+    - **II. Model architecture** (§6): an MLFF-shaped network applied to noised
+      structures.
+    - **III. Sampling** (§7): iterating the trained model from noise to
+      structures.
 
-    - **Training** (§6) is where a and b meet.
+    - **Training** (§6) is where I and II meet.
     - **Validation** (§7) follows sampling: turn "it looks like molecules" into
       numbers.
     - **The goal, plainly:** train GPFF on our 181-molecule QM9 slice and
@@ -309,13 +311,15 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 5. The forward process: making training data from noise
+    ## 5. The forward process: noising as data augmentation
 
     A force field trains on labels the dataset ships, energies and forces. A
-    diffusion model **manufactures its own**: noise a clean structure, then ask
-    the network for the way back.
+    diffusion model **manufactures its own**, and the forward process is where
+    that happens: it is **data augmentation**. Noise a clean structure, write
+    down the way back, and one dataset becomes an endless supply of labelled
+    training pairs.
 
-    ### Noising
+    ### I. Process: noising the geometry
 
     `schnetpack.generative` writes the forward process as an **interpolation**
     between the data $x_0$ and an endpoint $x_1$ drawn from a prior:
@@ -333,14 +337,8 @@ def _(mo):
       structure, with $\sigma(t)$ growing geometrically.
 
     We take **VE**, from $\sigma_\text{min} = 0.05$ to
-    $\sigma_\text{max} = 30$ Å.
-
-    - **$\sigma_\text{max}$ must at least match the data scale.** Rule of
-      thumb: the largest pairwise distance, ~7.7 Å here.
-    - **Neither failure is loud.** Too small and the endpoint still remembers
-      the data; too large and training wastes capacity.
-    - **Why 30 Å**: it is what §7's research-scale model was trained at, which
-      keeps every model here interchangeable.
+    $\sigma_\text{max} = 30$ Å. $\sigma_\text{max}$ has to be large enough that
+    nothing of the original structure is left to see at the end of the process.
 
     Below, and in every illustration that follows, one elongated open-chain
     isomer, easy to track through the noise, under both processes with the same
@@ -363,8 +361,10 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
     ve = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
 
+    SEED = 3  # the one seed this notebook uses; every draw below reuses it
+
     # a trajectory is just interpolate() evaluated along a grid of times
-    torch.manual_seed(3)
+    torch.manual_seed(SEED)
     t_noise = torch.linspace(0.0, 1.0, 13)
     z_noise = torch.randn_like(x0)  # shared draw: only its scale differs
     frames_vp = [vp.interpolate(x0, vp.prior.std * z_noise, t) for t in t_noise]
@@ -382,13 +382,13 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
         ghost_id=0,
         panel_labels=("x₀ (data)", "xₜ", "x₁ (prior)"),
     )
-    return SIGMA_MAX, chain, ve, x0
+    return SEED, SIGMA_MAX, chain, ve, x0
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Labels: what should the network predict?
+    ### II. Parametrization: defining the training targets
 
     Noised structures are half the training data; the **label** is the other
     half, and choosing it is the second axis, the `Parametrization`. All three
@@ -396,11 +396,10 @@ def _(mo):
     target's magnitude scales with $\sigma$, which is exactly what a plain L2
     loss sees.
 
-    | parametrization | target | scales with $\sigma$ as | recover $x_0$ |
-    |---|---|---|---|
-    | `EpsParametrization` | $\varepsilon$ | constant | $x_t - \sigma\varepsilon$ |
-    | `ScoreParametrization` | $s = \nabla_x \log p_t(x_t) = -\varepsilon/\sigma$ | $1/\sigma$ | $x_t + \sigma^2 s$ |
-    | `PseudoForceParametrization` | $F = 2\,(x_0 - x_t)$ | $\sigma$ | $x_t + F/2$ |
+    - **`EpsParametrization`**: $\varepsilon$
+    - **`ScoreParametrization`**:
+      $s = \nabla_x \log p_t(x_t) = -\varepsilon/\sigma$
+    - **`PseudoForceParametrization`**: $F = 2\,(x_0 - x_t)$
 
     GPFF takes the **pseudo force**, whose magnitude grows in proportion to
     $\sigma$. That buys two things:
@@ -422,7 +421,7 @@ def _(mo):
 
 
 @app.cell
-def _(chain, ve, torch, viz, x0):
+def _(SEED, chain, torch, ve, viz, x0):
     from schnetpack.generative import (
         EpsParametrization,
         PseudoForceParametrization,
@@ -435,11 +434,11 @@ def _(chain, ve, torch, viz, x0):
 
     # one path, three targets: `target` turns the same (x0, x1, t) into
     # whichever field the network is asked to predict
-    torch.manual_seed(3)
+    torch.manual_seed(SEED)
     t_param = torch.linspace(1.0, 0.2, 13)
     x1_param = ve.prior.sample_like(x0)
     ts_param = [torch.full((len(x0),), float(ti)) for ti in t_param]
-    frames_param = [ve.interpolate(x0, x1_param, t) for t in ts_param]
+    xt_frames = [ve.interpolate(x0, x1_param, t) for t in ts_param]
     targets = {
         # the pseudo force is drawn at half length: F/2 = x0 - x_t is the
         # offset itself, so each arrow lands exactly on the clean structure
@@ -452,7 +451,7 @@ def _(chain, ve, torch, viz, x0):
     }
 
     viz.show_frames(
-        {name: frames_param for name in targets},
+        {name: xt_frames for name in targets},
         chain,
         n_frames=5,
         times=t_param.tolist(),
@@ -469,23 +468,17 @@ def _(mo):
     drawn from), equally swappable constructor arguments. The prior returns in
     §8b, where replacing it is half the task.
 
-    ### Wrapping it into a transform
+    ### III. Diffuse: wrapping both into a transform
 
     - **It is preprocessing, so it is a transform** like §3's.
       `Diffuse(process, parametrization)` runs the forward process inside the
       dataloader: per structure it draws a time, noises the positions, and
       writes the label into the item dict.
-    - **Where those draws land is its own choice**, the `t_sampler`. Uniform
-      $t$ on a geometric schedule is *log-uniform* in $\sigma$: equal weight to
-      every decade from 0.05 to 30 Å, so a third of the budget lands above 3 Å,
-      where the target is nearly the endpoint itself and there is little to
-      learn.
-    - **`LogNormalSigmaTimes` states the density in $\sigma$**, where it means
-      something: log-normal, median ~0.5 Å, most of the mass between 0.15 and
-      1.7 Å, the band where bonds live and denoising is genuinely hard. This is
-      GPFF's own training density (and EDM's, for images); the process converts
-      to $t$ through `t_of_sigma`, and `truncate=True` redraws the few draws
-      falling outside the schedule instead of piling them onto its ends.
+    - **Where those draws land is its own choice**, the `t_sampler`. Timesteps
+      can be sampled in different ways, and we follow Karras et al.:
+      `LogNormalSigmaTimes` concentrates them in the range of noise levels
+      where the model can actually learn something. Its values were measured
+      empirically.
 
     Only the transform order needs thought:
 
@@ -532,11 +525,11 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, ve, trn):
             trn.CastTo32(),
         ],
     )
-    # a small draw from the pipeline, only so the picture below stays a
+    # a small batch from the pipeline, only so the picture below stays a
     # picture; a hundred viewers on one page is not one
-    peek = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
-    {key: tuple(peek[key].shape) for key in ("_positions", "pseudo_force", "t")}
-    return CUTOFF, diffused, peek
+    diffused_batch = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
+    {key: tuple(diffused_batch[key].shape) for key in ("_positions", "pseudo_force", "t")}
+    return CUTOFF, diffused, diffused_batch
 
 
 @app.cell
@@ -558,15 +551,15 @@ def _(mo):
 
 
 @app.cell
-def _(peek, ve, properties, viz):
+def _(diffused_batch, ve, properties, viz):
     # one box per structure of the batch, captioned with its own noise level
-    sigma_peek = ve.sigma(peek["t_structure"])
+    sigma_batch = ve.sigma(diffused_batch["t_structure"])
     viz.show_trajectory(
-        [peek[properties.R]],
-        peek,
+        [diffused_batch[properties.R]],
+        diffused_batch,
         # F/2 = x0 - x_t, so each arrow ends on the clean structure
-        vectors=[peek["pseudo_force"] / 2],
-        titles=[f"σ = {float(s):.2f} Å" for s in sigma_peek],
+        vectors=[diffused_batch["pseudo_force"] / 2],
+        titles=[f"σ = {float(s):.2f} Å" for s in sigma_batch],
         cell_px=170,
         zoom=1.0,
     )
@@ -615,7 +608,7 @@ def _(mo):
 
 
 @app.cell
-def _(CUTOFF, DEVICE, torch):
+def _(CUTOFF, DEVICE, SEED, torch):
     import schnetpack.nn as snn
     from schnetpack.model import (
         AtomwiseVector,
@@ -624,7 +617,7 @@ def _(CUTOFF, DEVICE, torch):
         PairwiseDistances,
     )
 
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
 
     # the denoiser: an ordinary MLFF, read out as a vector per atom
     gpff_net = NeuralNetworkPotential(
@@ -791,8 +784,9 @@ def _(mo):
     - **§6's network is teaching-sized** and saw 181 structures. Denoising has
       to be accurate exactly where geometry is decided, at
       $\sigma \lesssim 0.3$ Å where bond lengths live, precisely where the time
-      sampler concentrated its training. Expect roughly half the draws to be
-      chemically valid molecules; the cell below measures it.
+      sampler concentrated its training. Expect a good share of the draws to
+      come out as chemically valid molecules, direct denoising ahead of the
+      ladder; the cell below measures it.
     - **The bundle also ships `checkpoints/gpff_big.pt`**: same pseudo-force
       target, same VE process, same $\sigma$-focused time sampling, at
       **research scale, 5.1M parameters trained on all ~130k molecules of
@@ -910,13 +904,14 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
+    SEED,
     force_param,
     gen_model,
     numbers,
-    ve,
     properties,
     to_device,
     torch,
+    ve,
     viz,
 ):
     from helpers import fully_connected_batch, make_model_fn, recording_model_fn
@@ -924,7 +919,7 @@ def _(
     from schnetpack.generative.integrators import Ancestral
 
     N_LADDER = 64
-    torch.manual_seed(2)
+    torch.manual_seed(SEED)
 
     # 8 molecules-to-be, laid out where the model lives
     sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
@@ -1016,15 +1011,16 @@ def _(
     force_param,
     model_fn,
     n_total,
-    ve,
     recording_model_fn,
     sampling_batch,
+    SEED,
     torch,
+    ve,
     viz,
 ):
     from schnetpack.generative import DirectDenoisingSampler
 
-    torch.manual_seed(2)
+    torch.manual_seed(SEED)
     direct = DirectDenoisingSampler(ve, force_param, stochastic_lambda=1.0)
 
     # draw the start from the prior (a 30 Å cloud per molecule), then run
@@ -1344,22 +1340,23 @@ def _(DirectDenoisingSampler, torch):
 @app.cell
 def _(
     DEVICE,
-    ShapeGuidedDenoising,
     force_param,
     n_task,
-    ve,
     properties,
     recording_model_fn,
+    SEED,
+    ShapeGuidedDenoising,
     smiles_per_molecule,
     task_batch,
     task_model_fn,
     torch,
+    ve,
     viz,
 ):
     SAMPLER = ShapeGuidedDenoising  # yours; ShapeGuidedSolution is the reference
     SHAPE_TARGET = (0.85, 0.13, 0.02)  # rod · disc (0.50, 0.45, 0.05) · ball (1/3, 1/3, 1/3)
 
-    torch.manual_seed(7)
+    torch.manual_seed(SEED)
     shaped = SAMPLER(
         ve,
         force_param,
@@ -1628,25 +1625,26 @@ def _(DirectDenoisingSampler, torch):
 @app.cell
 def _(
     DEVICE,
-    SIGMA_MAX,
-    ScaffoldDenoising,
-    ScaffoldPrior,
     force_param,
     free_atoms,
-    ve,
     properties,
     recording_model_fn,
     scaffold_batch,
     scaffold_model_fn,
+    ScaffoldDenoising,
+    ScaffoldPrior,
+    SEED,
+    SIGMA_MAX,
     smiles_per_molecule,
     torch,
+    ve,
     viz,
     x_kept,
 ):
     # yours; the references are ScaffoldPriorSolution and ScaffoldDenoisingSolution
     PRIOR, SAMPLER_B = ScaffoldPrior, ScaffoldDenoising
 
-    torch.manual_seed(11)
+    torch.manual_seed(SEED)
     scaffolded = SAMPLER_B(
         ve,
         force_param,
