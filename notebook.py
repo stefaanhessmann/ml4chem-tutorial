@@ -430,21 +430,17 @@ def _(mo):
        would be unlearnable noise in every label;
     2. `Diffuse` — overwrites `R` with $x_t$, writes the label
        `"pseudo_force"` and the time `"t"`;
-    3. `MatScipyNeighborList` — **after** noising, with a cutoff sized for
-       *noised* structures (150 Å — a fully noised cloud is ~90 Å across);
+    3. `AllToAllNeighborList` — **after** noising, and every pair is a
+       neighbor. A *distance*-based list is the wrong tool here: one built on
+       $x_t$ at one noise level is wrong at another, and a cutoff wide enough
+       for a fully noised cloud (~90 Å across) would return every pair anyway
+       — at the cost of searching for them. Saying it directly is cheaper and
+       stays correct at every $t$. Pairs the model's cutoff function
+       downweights to zero cost nothing;
     4. `CastTo32`.
 
     An ordinary MSE against `"pseudo_force"` is then the whole training
     objective — no special training loop anywhere.
-
-    One practical note for §6. `Diffuse` runs *per structure*, in a dataloader
-    worker, which is the right place for it when the structures are many and
-    large. Ours are neither — 181 molecules of 12 atoms — and at that size the
-    preprocessing costs several times more per step than the model does. So
-    §6 keeps the same two library calls (`process.perturb`, then the
-    parametrization's `target`) but makes them on the GPU, on structures that
-    stay resident there. Same noising, same labels, same objective; roughly
-    five times the training steps per minute.
     """)
     return
 
@@ -471,7 +467,7 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
                 label_key="pseudo_force",
                 time_key="t",
             ),
-            trn.MatScipyNeighborList(cutoff=CUTOFF),
+            trn.AllToAllNeighborList(),
             trn.CastTo32(),
         ],
     )
@@ -479,7 +475,7 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
     # picture; a hundred viewers on one page is not one
     peek = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
     {key: tuple(peek[key].shape) for key in ("_positions", "pseudo_force", "t")}
-    return CUTOFF, peek, t_sampler
+    return CUTOFF, diffused, peek
 
 
 @app.cell
@@ -600,11 +596,21 @@ def _(mo):
     mo.md(r"""
     ### Training
 
-    Model and data augmentation meet in an ordinary PyTorch loop: draw a
-    minibatch of molecules, noise them, compare the model's prediction against
-    the pseudo-force label, step the optimizer. The three diffusion-specific
-    lines are the ones §5 already introduced — `t_sampler`, `process.perturb`,
-    `force_param.target` — run here rather than in the dataloader.
+    Model and data augmentation meet in an ordinary PyTorch loop: pull a batch
+    from an `AtomsLoader` over §5's diffused dataset, compare the model's
+    prediction against the `"pseudo_force"` label, step the optimizer. Nothing
+    in the loop knows it is training a generative model — the transforms did
+    that part.
+
+    The loader is worth one look, because the obvious way to build it is slow.
+    181 structures at batch 64 is under three batches per epoch, and a
+    dataloader spends its first batches filling a prefetch queue that it then
+    throws away at the epoch boundary — so with tiny epochs the workers never
+    get ahead and the GPU waits. Handing it a `RandomSampler` with
+    `replacement=True` and `num_samples = BATCH * STEPS` turns the whole run
+    into *one* epoch of 12000 batches, drawn with replacement. The workers
+    pipeline, preprocessing hides behind the backward pass, and the training
+    loop becomes a single `for` over the loader.
 
     The one line worth arguing about is the **loss weight**
     $\min(1/\sigma(t)^2, w_\text{max})$. The $1/\sigma^2$ undoes the label's
@@ -618,8 +624,10 @@ def _(mo):
     the honest $1/\sigma^2$ almost everywhere.
 
     Two things about the loop's shape. **Every step sees fresh
-    $(t, \text{noise})$ draws** — the dataset is effectively infinite, and a
-    model that saw a fixed set of noised structures would memorize them
+    $(t, \text{noise})$ draws**, because the transforms re-run on every item
+    the loader hands out — the dataset is effectively infinite, and a model
+    that saw a fixed set of noised structures (say, from an
+    `itertools.cycle` over a cached list of batches) would memorize them
     instead of learning the denoising field. And the weights that get used
     downstream are an **exponential moving average** of the ones the optimizer
     visited: a few thousand steps is a noisy place to stop, and the averaged
@@ -636,41 +644,32 @@ def _(mo):
 
 
 @app.cell
-def _(
-    AtomsLoader,
-    DEVICE,
-    dataset,
-    force_param,
-    gpff_net,
-    process,
-    properties,
-    t_sampler,
-    torch,
-):
+def _(AtomsLoader, DEVICE, diffused, gpff_net, process, torch):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
 
-    from helpers import fully_connected_batch, to_device
+    from helpers import to_device
 
-    STEPS, N_MOL, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
+    STEPS, BATCH, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
 
-    # the whole clean dataset, centered by §3's transform, kept on the GPU
-    clean = to_device(next(iter(AtomsLoader(dataset, batch_size=len(dataset)))), DEVICE)
-    n_at = int(clean[properties.n_atoms][0])
-    x0_all = clean[properties.R].reshape(-1, n_at, 3)
-    # the isomers share a composition but not an atom *order* — 101 orderings
-    # across the 181 — so Z is gathered along with the positions. The pair
-    # list is not: fully connected is the same block-diagonal layout whatever
-    # the elements are, and stays valid at every noise level.
-    z_all = clean[properties.Z].reshape(-1, n_at)
-    layout = to_device(fully_connected_batch([1] * n_at, n_mol=N_MOL), DEVICE)
-    idx_m = layout[properties.idx_m]
+    # the whole run as one epoch of STEPS batches, drawn with replacement —
+    # which is what lets the workers stay ahead of the GPU (see above)
+    train_loader = AtomsLoader(
+        diffused,
+        batch_size=BATCH,
+        sampler=torch.utils.data.RandomSampler(
+            diffused, replacement=True, num_samples=BATCH * STEPS
+        ),
+        num_workers=4,
+        persistent_workers=True,
+    )
 
-    def gpff_loss(pred, label, t):
+    def gpff_loss(pred, inputs):
         # 1/sigma^2 undoes the label's sigma-scaling; the ceiling keeps the
         # small-sigma end — where bonds are decided — from being flattened away
-        weight = (1.0 / process.sigma(t) ** 2).clamp(max=100.0)
-        return (weight[:, None] * (pred - label) ** 2).mean()
+        weight = (1.0 / process.sigma(inputs["t"]) ** 2).clamp(max=100.0)
+        diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
+        return (weight[:, None] * diff**2).mean()
 
     optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
     # decay the step size geometrically from LR_START to LR_END across the
@@ -682,23 +681,10 @@ def _(
     ema = {key: v.detach().clone().float() for key, v in gpff_net.state_dict().items()}
 
     history = []
-    steps = tqdm(range(STEPS), desc="step", unit="it")
-    for step in steps:
-        # fresh molecules, fresh times, fresh noise — §5's three calls, here
-        pick = torch.randint(len(x0_all), (N_MOL,), device=DEVICE)
-        t = t_sampler(N_MOL, DEVICE).to(x0_all.dtype)[idx_m]  # one time per molecule
-        x_t, x0_clean, x1_noise, t_atoms, eps = process.perturb(
-            x0_all[pick].reshape(-1, 3), t=t, context=layout
-        )
-
-        train_batch = dict(layout)
-        train_batch[properties.Z] = z_all[pick].reshape(-1)
-        train_batch[properties.R] = x_t
-        loss = gpff_loss(
-            gpff_net(train_batch)["pseudo_force_pred"],
-            force_param.target(process, x0_clean, x1_noise, t_atoms, eps),
-            t_atoms,
-        )
+    steps = tqdm(train_loader, desc="step", unit="it", total=STEPS)
+    for step, train_batch in enumerate(steps):
+        train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
+        loss = gpff_loss(gpff_net(train_batch), train_batch)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -722,7 +708,7 @@ def _(
     loss_ax.set_xlabel("step")
     loss_ax.set_ylabel("weighted pseudo-force MSE")
     loss_ax.grid(alpha=0.3)
-    return fully_connected_batch, gpff_model, plt, to_device
+    return gpff_model, plt, to_device
 
 
 @app.cell
@@ -865,7 +851,6 @@ def _(mo):
 def _(
     DEVICE,
     force_param,
-    fully_connected_batch,
     gen_model,
     numbers,
     process,
@@ -874,7 +859,7 @@ def _(
     torch,
     viz,
 ):
-    from helpers import make_model_fn, recording_model_fn
+    from helpers import fully_connected_batch, make_model_fn, recording_model_fn
     from schnetpack.generative import Sampler
     from schnetpack.generative.integrators import Ancestral
 
