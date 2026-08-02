@@ -151,13 +151,14 @@ def _(mo):
 
     ### How generative models fit in
 
-    - **A denoiser is an MLFF.** It reads a structure and predicts a 3-vector
-      per atom, and GPFF makes the kinship literal: what it learns *is* a
-      force, one pointing every atom back toward the clean structure rather
-      than downhill in energy.
-    - **So everything else is reused**: the same architectures, the same
-      datasets and transform pipeline, the same training loop. Only the forward
-      process and the sampler are new.
+    - **GPFF states diffusion in the language of force fields.** Its target is
+      a **pseudo force**, and that force defines a **pseudo potential energy
+      surface**: noised structures sit uphill, and the field points every atom
+      back down toward the clean structure. Where an MLFF learns the forces of
+      a real PES, GPFF learns the forces of this one.
+    - **So the rest carries over.** Same architectures, same data pipeline and
+      transforms, same training loop. Only the forward process that makes the
+      training data and the sampler that runs the model backwards are new.
     """)
     return
 
@@ -167,16 +168,21 @@ def _(mo):
     mo.md(r"""
     ## 3. Using your own data in SchNetPack
 
-    - **Everything starts from a database.** SchNetPack reads training data
-      from an **ASE-backed SQLite database**, so whatever format your
-      structures start in, step one is to put them in a db.
+    - **Atomistic data comes in many formats.** **xyz** and **extended xyz**
+      for molecules, **PDB** and **SDF/MOL** in the chemistry and biology
+      tools, **CIF** and **POSCAR** for periodic structures, and whatever your
+      electronic-structure code writes out (Gaussian, ORCA, VASP, CP2K).
+    - **SchNetPack reads one of them**: an **ASE-backed SQLite database**. So
+      whatever your structures start in, step one is a conversion.
+    - **`schnetpack.data` provides the tools for it.** `ASEAtomsData.create`
+      declares the stored properties with their units, and `add_systems` fills
+      the database with `ase.Atoms`, which ASE will have parsed from any of the
+      formats above.
     - **Our data** is an xyz file with all **181 isomers of C₄H₄N₂O₂** in QM9.
       One fixed composition, so the generative model only has to learn *where
       the atoms go*, not which atoms to place.
-    - **Two calls build it.** `ASEAtomsData.create` declares the stored
-      properties with their units, and `add_systems` fills it with `ase.Atoms`.
-    - **We store the U0 energies** from the xyz. They are unused here, but a
-      database declares its properties up front and real datasets carry them.
+    - **We also store the U0 energies** from the xyz. They are unused here, but
+      a database declares its properties up front and real datasets carry them.
     """)
     return
 
@@ -786,8 +792,7 @@ def _(mo):
       to be accurate exactly where geometry is decided, at
       $\sigma \lesssim 0.3$ Å where bond lengths live, precisely where the time
       sampler concentrated its training. Expect roughly half the draws to be
-      chemically valid molecules and nearly all of them to be sane geometry;
-      the cells below measure it.
+      chemically valid molecules; the cell below measures it.
     - **The bundle also ships `checkpoints/gpff_big.pt`**: same pseudo-force
       target, same VE process, same $\sigma$-focused time sampling, at
       **research scale, 5.1M parameters trained on all ~130k molecules of
@@ -1040,79 +1045,26 @@ def _(
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Did we actually make molecules?
+    ### Did we make molecules? Validity
 
-    A rendered batch can look right and still hide broken geometry, so turn
-    "it looks like molecules" into numbers. The simplest checks live on each
-    structure's nearest-neighbor distances:
+    A rendered batch can look right and still be no molecule at all, so turn
+    "it looks like molecules" into a number.
 
-    - two atoms closer than **0.7 Å** are fused, a *clash*;
-    - an atom whose nearest neighbor is beyond **2.5 Å** is bonded to
-      nothing, a *stray*.
-
-    - **The dataset row calibrates both.** Real bond lengths here are
-      ~1.0–1.5 Å, and a clean batch scores zero on each by construction.
-    - **Being able to say *how many* is the point.** That number is what tells
-      you whether a change to the model, the process or the sampler actually
-      helped.
-    """)
-    return
-
-
-@app.cell
-def _(batch, properties, sampling_batch, torch, x_ancestral, x_direct):
-    def geometry_checks(x, layout):
-        """Nearest-neighbor distances per molecule: min = closest pair, max = loneliest atom."""
-        rows = []
-        for m in range(int(layout[properties.n_atoms].shape[0])):
-            pos = x[layout[properties.idx_m] == m]
-            eye = torch.eye(len(pos), device=x.device)
-            dist = torch.cdist(pos, pos) + eye * 1e6  # mask self-pairs
-            nearest = dist.min(dim=1).values
-            rows.append((float(nearest.min()), float(nearest.max())))
-        return rows
-
-    def geometry_summary(x, layout):
-        rows = geometry_checks(x, layout)
-        min_pairs, max_gaps = [r[0] for r in rows], [r[1] for r in rows]
-        return {
-            "all finite": bool(torch.isfinite(x).all()),
-            "clashes (pair < 0.7 Å)": sum(mp < 0.7 for mp in min_pairs),
-            "strays (gap > 2.5 Å)": sum(g > 2.5 for g in max_gaps),
-            "closest pair [Å]": f"{min(min_pairs):.2f} … {max(min_pairs):.2f}",
-            "largest gap [Å]": f"{min(max_gaps):.2f} … {max(max_gaps):.2f}",
-        }
-
-    {
-        "dataset (reference)": geometry_summary(batch[properties.R], batch),
-        "ancestral (8)": geometry_summary(x_ancestral, sampling_batch),
-        "direct denoising (8)": geometry_summary(x_direct, sampling_batch),
-    }
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ### From geometry to chemistry
-
-    Distance checks ask whether the geometry is *sane*, never whether it is a
-    *molecule*. RDKit can: `rdDetermineBonds` infers a bond graph from nothing
-    but the coordinates, and a structure counts as **chemically valid** only if
-    that graph works out, with every valence satisfied as a neutral molecule, no
-    unpaired electrons left over, everything in one connected piece. What
-    passes earns a **SMILES** string: the molecule's identity, independent of
-    coordinates.
-
-    - the **valid fraction** is the standard headline metric for molecular
-      generative models;
-    - **SMILES** says *which* molecule each sample is: compare against the
-      dataset's to see whether the model reproduced a training isomer or found
-      a new one.
-
-    It is a *strict* judge: a single fused pair already sinks a sample, which
-    is what makes it honest. Flip `USE_BIG_MODEL` and see what a network
-    trained on all of QM9 does to it.
+    - **RDKit reads chemistry out of coordinates.** `rdDetermineBonds` infers a
+      bond graph from nothing but the positions, and a structure counts as
+      **chemically valid** only if that graph works out: every valence
+      satisfied as a neutral molecule, no unpaired electrons left over,
+      everything in one connected piece.
+    - **The valid fraction** is the standard headline metric for molecular
+      generative models, and the dataset row calibrates it: a real batch scores
+      full marks by construction.
+    - **What passes earns a SMILES string**, the molecule's identity
+      independent of coordinates. It says *which* molecule each sample is, so
+      compare against the dataset's to see whether the model reproduced a
+      training isomer or found a new one.
+    - **It is a strict judge.** A single fused pair already sinks a sample,
+      which is what makes it honest. Flip `USE_BIG_MODEL` and see what a
+      network trained on all of QM9 does to it.
     """)
     return
 
