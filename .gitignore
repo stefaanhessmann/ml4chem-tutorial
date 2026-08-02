@@ -20,10 +20,6 @@ gpff_qm9.py
 sample_gpff_qm9.py
 sample_direct_gpff_qm9.py
 
-# The §8 answers. Same rule, sharper reason: the tasks ship as stubs with
-# TODOs, so shipping this beside them would be shipping the answer key.
-# Hand it out after the session.
-solutions.py
 
 # Superseded copies kept for reference.
 *.bak
@@ -32,8 +28,8 @@ __pycache__/
 __marimo__/
 *.pyc
 
-# Instructor check for the section-8 tasks (runs solutions.py against the
-# shipped runner cells). Same rule: stays on disk.
+# Instructor check for the section-8 tasks: runs the notebook's own runner
+# cells against its folded reference solutions. Same rule: stays on disk.
 check_solutions.py
 
 # Locally executed copy with outputs baked in (~6 MB); notebook.ipynb stays

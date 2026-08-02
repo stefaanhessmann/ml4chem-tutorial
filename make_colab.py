@@ -181,7 +181,20 @@ def build(repo: str, pin: str, out: Path, schnetpack: Path = None) -> None:
             f"expected exactly one local-setup block to rewrite, found {len(hits)}"
         )
 
-    # 3. the setup cell goes directly under the prose that introduces it, so the
+    # 3. §8's reference solutions are marimo hide_code cells. marimo's export
+    #    states that the way JupyterLab understands it (jupyter.source_hidden),
+    #    which Colab ignores — there a hidden code cell is `# @title` plus
+    #    cellView=form, and the reader clicks the title to reveal it. With
+    #    both set, the same two cells collapse in either frontend.
+    hidden = 0
+    for cell in cells:
+        if cell["cell_type"] == "code" and "# @title" in "".join(cell["source"]):
+            cell["metadata"]["cellView"] = "form"
+            hidden += 1
+    if hidden != 2:
+        sys.exit(f"expected 2 hidden solution cells, found {hidden}")
+
+    # 4. the setup cell goes directly under the prose that introduces it, so the
     #    notebook still opens on its title and "the cell below" stays true
     at = hits[0] + 1
     nb["cells"] = cells[:at] + [setup_cell(repo, pin, wheel)] + cells[at:]

@@ -885,6 +885,15 @@ def _n_rows(trajectory, batch: dict) -> int:
     return n_runs * int(_numpy(batch[properties.n_atoms]).shape[0])
 
 
+def show_page(html: str, height: int = 300):
+    """Put an already-built page on screen — one saved earlier by :func:`export_html`.
+
+    The pages above are self-contained, so a trajectory can be rendered once,
+    written to a file, and shown later without re-running what produced it.
+    """
+    return _embed(html, 1, 2, 0, height)
+
+
 def export_html(html: str, path: str) -> str:
     """Write a page built above to a standalone ``.html`` file. Returns ``path``."""
     page = (
