@@ -3,11 +3,11 @@
 data/*.db
 
 # Checkpoints are large and mostly experimental. Ship exactly the ones the
-# tutorial loads — adding another is one line here, deliberately.
+# tutorial loads — adding another is one line here, deliberately. The §6
+# model is not among them: that cell trains it live, every run.
 checkpoints/*
-!checkpoints/gpff.pt
-# 20 MB, and the reason §7-8 generate real molecules where the small model
-# above cannot. Converted from the GPFF QM9 run by convert_gpff_seed999.py.
+# 20 MB, and what §7's USE_BIG_MODEL switches to for the research-scale
+# comparison. Converted from the GPFF QM9 run by convert_gpff_seed999.py.
 !checkpoints/gpff_big.pt
 
 # Development scripts: they stay on disk, they do not go to students.
@@ -22,6 +22,3 @@ sample_direct_gpff_qm9.py
 __pycache__/
 __marimo__/
 *.pyc
-
-# trained live by the notebook (and by make_checkpoints.py); never ships
-checkpoints/gpff.pt

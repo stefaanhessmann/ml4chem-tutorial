@@ -43,6 +43,7 @@ def _(mo):
     │   └── qm9_c4h4n2o2.xyz   ← the dataset: 181 small molecules from QM9
     ├── checkpoints/
     │   └── gpff_big.pt        ← a GPFF at research scale (all of QM9); §7's switch swaps it in
+    │                            — the §6 model is trained live, not shipped
     ├── helpers.py             ← small glue code (batch adapters for sampling)
     ├── viz.py                 ← 3D molecule viewer
     └── assets/3Dmol-min.js    ← vendored viewer library (works offline)
@@ -66,8 +67,8 @@ def _(mo):
     **Hardware.** The first code cell sets `DEVICE` to a GPU when one is
     available and to the CPU otherwise; the model and every batch follow it,
     and nothing below is device-specific. The GPU matters in exactly one
-    place — §6's training run, about 4 minutes there against ~40 on a CPU;
-    everything else is comfortable either way.
+    place — §6's training run, a couple of minutes there against ~15 on a
+    CPU; everything else is comfortable either way.
     """)
     return
 
@@ -265,19 +266,16 @@ def _(mo):
       ramps: classic score matching's geometric one (`VE`) and the straight
       one (`VELinear`) — $\sigma(t) = t\,\sigma_\text{max}$, the EDM/GPFF
       geometry — which is what we use. The noise scale is the **prior's**:
-      $\sigma_\text{max}$ must match the data scale — rule of thumb: at least
-      the largest pairwise distance, ~7.7 Å here. Too small and the endpoint
-      still remembers the data; too large and training wastes capacity — and
-      *neither failure is loud*. We take **30 Å** — deliberately generous,
-      because it is what the ready-trained generation model of §7 uses, and
-      staying on one process keeps every model in this notebook
-      interchangeable.
+      $\sigma_\text{max}$ must match the data scale — rule of thumb: the
+      largest pairwise distance, ~7.7 Å here, so we take **10 Å**. Too small
+      and the endpoint still remembers the data; too large and training wastes
+      capacity — and *neither failure is loud*.
 
     For all illustrations we use a single molecule: an elongated, open-chain
     isomer whose shape is easy to track through the noise. Below, that chain
     under both processes with the same underlying noise draw (slider = $t$):
     VP shrinks it into a small fixed-size cloud, VE leaves it in place and
-    buries it under a 30 Å one.
+    buries it under a 10 Å one.
     """)
     return
 
@@ -287,10 +285,10 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
     from schnetpack.generative import VP, GaussianPrior, VELinear
 
     # the process every later section shares. The prior carries the scale —
-    # 30 Å, matching the §7 generation model — and GPFF's endpoint convention:
-    # a plain iid Gaussian, not re-centered per molecule.
+    # 10 Å, the data's own — and GPFF's endpoint convention: a plain iid
+    # Gaussian, not re-centered per molecule.
     process = VELinear(
-        t_min=0.0, t_max=1.0, prior=GaussianPrior(std=30.0, centered=False)
+        t_min=0.0, t_max=1.0, prior=GaussianPrior(std=10.0, centered=False)
     )
     vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
 
@@ -343,10 +341,13 @@ def _(mo):
     `ScoreParametrization` the score, whose magnitude runs like $1/\sigma$.
 
     Below, the same noising path three times, with the **training target drawn
-    as an arrow on every atom**. The pseudo-force arrows are long in deep
-    noise and shrink to nothing as the structure comes home — that is
-    $\mathrm{RMS}(F) = 2\sigma$ made visible. The eps arrows keep their size
-    everywhere; the score arrows explode as $\sigma \to 0$.
+    as an arrow on every atom** — eps, score, pseudo force. The eps arrows
+    keep their size everywhere; the score arrows explode as $\sigma \to 0$;
+    the pseudo-force arrows are long in deep noise and shrink to nothing as
+    the structure comes home, which is $\mathrm{RMS}(F) = 2\sigma$ made
+    visible. That last row is drawn at **half length**, as $F/2 = x_0 - x_t$:
+    the arrow is then the offset itself, and its tip is where the atom is
+    headed.
     """)
     return
 
@@ -371,11 +372,13 @@ def _(chain, process, torch, viz, x0):
     ts_param = [torch.full((len(x0),), float(ti)) for ti in t_param]
     frames_param = [process.interpolate(x0, x1_param, t) for t in ts_param]
     targets = {
-        name: [p.target(process, x0, x1_param, t) for t in ts_param]
-        for name, p in (
-            ("pseudo-force target", force_param),
-            ("eps target", eps_param),
-            ("score target", score_param),
+        # the pseudo force is drawn at half length: F/2 = x0 - x_t is the
+        # offset itself, so each arrow lands exactly on the clean structure
+        name: [scale * p.target(process, x0, x1_param, t) for t in ts_param]
+        for name, p, scale in (
+            ("eps target", eps_param, 1.0),
+            ("score target", score_param, 1.0),
+            ("pseudo-force target (F/2)", force_param, 0.5),
         )
     }
 
@@ -422,7 +425,7 @@ def _(mo):
     2. `Diffuse` — overwrites `R` with $x_t$, writes the label
        `"pseudo_force"` and the time `"t"`;
     3. `MatScipyNeighborList` — **after** noising, with a cutoff sized for
-       *noised* structures (150 Å — a fully noised cloud is ~90 Å across);
+       *noised* structures (30 Å, not the ~7 Å the clean molecules span);
     4. `CastTo32`.
 
     An ordinary MSE against `"pseudo_force"` is then the whole training
@@ -435,7 +438,7 @@ def _(mo):
 def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
     from schnetpack.generative import Diffuse, LogNormalSigmaTimes
 
-    CUTOFF = 150.0  # must cover *noised* structures — clouds ~90 Å across
+    CUTOFF = 30.0  # must cover *noised* structures, not just clean ones
 
     # train mostly around half an Ångström of displacement — GPFF's density
     t_sampler = LogNormalSigmaTimes(process, mean=-0.7, std=1.2, truncate=True)
@@ -527,8 +530,8 @@ def _(mo):
        features and predicts a 3-vector per atom. (An energy model would end
        in `Atomwise` instead: a scalar per atom, summed per molecule.)
 
-    The cutoff is 150 Å because this force field sees *noised* structures — a
-    fully noised cloud is ~90 Å across.
+    The cutoff is 30 Å because this force field sees *noised* structures,
+    whose atoms are tens of Ångström apart.
     """)
     return
 
@@ -586,25 +589,23 @@ def _(mo):
     noise freezes and the model memorizes a fixed set of noised structures
     rather than learning the denoising field.
 
-    No checkpoint ships for this model — the cell below trains it: roughly 4
-    minutes on a GPU against ~40 on a CPU, the one place in this notebook the
-    hardware genuinely matters. It saves what it trained, so re-running the
-    cell later reloads instantly; `RETRAIN = True` forces a fresh run
-    instead. Don't over-read the loss curve: it plateaus well above zero
+    No checkpoint for this one — the cell below *is* the training run: a
+    couple of minutes on a GPU against ~15 on a CPU, the one place in this
+    notebook the hardware genuinely matters. Re-running the cell trains again
+    from scratch. Don't over-read the loss curve: it plateaus well above zero
     because every noise level keeps an irreducible error — that is healthy.
     """)
     return
 
 
 @app.cell
-def _(DEVICE, HERE, gpff_net, os, process, torch, train_loader):
+def _(DEVICE, gpff_net, process, torch, train_loader):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
 
     from helpers import to_device
 
-    CKPT = os.path.join(HERE, "checkpoints", "gpff.pt")
-    RETRAIN = False  # True: retrain even if an earlier run saved a checkpoint
+    EPOCHS, LR_START, LR_END = 200, 5e-4, 1e-5
 
     def gpff_loss(pred, inputs):
         # 1/sigma^2 undoes the label's sigma-scaling; the clamp keeps
@@ -613,39 +614,32 @@ def _(DEVICE, HERE, gpff_net, os, process, torch, train_loader):
         diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
         return (weight[:, None] * diff**2).mean()
 
-    if os.path.exists(CKPT) and not RETRAIN:
-        ckpt_state = torch.load(CKPT, weights_only=True, map_location=DEVICE)
-        gpff_net.load_state_dict(ckpt_state["state_dict"])
-        history = [tuple(h) for h in ckpt_state["history"]]
-    else:
-        EPOCHS, LR_START, LR_END = 500, 5e-4, 1e-5
-        optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
-        # decay the step size geometrically from LR_START to LR_END across the
-        # run — one factor per epoch, so the last epochs only polish
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer, gamma=(LR_END / LR_START) ** (1 / EPOCHS)
+    optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
+    # decay the step size geometrically from LR_START to LR_END across the
+    # run — one factor per epoch, so the last epochs only polish
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=(LR_END / LR_START) ** (1 / EPOCHS)
+    )
+    history, step = [], 0
+    # the bar counts epochs; its postfix is that epoch's mean loss, the same
+    # number the curve below plots
+    epochs = tqdm(range(EPOCHS), desc="epoch", unit="ep")
+    for epoch in epochs:
+        running = 0.0
+        for train_batch in train_loader:  # fresh (t, noise) draws every epoch
+            step += 1
+            train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
+            loss = gpff_loss(gpff_net(train_batch), train_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running += loss.item()
+            history.append((step, loss.item()))
+        scheduler.step()
+        epochs.set_postfix(
+            loss=f"{running / len(train_loader):.4f}",
+            lr=f"{scheduler.get_last_lr()[0]:.1e}",
         )
-        history, step = [], 0
-        # the bar counts epochs; its postfix is that epoch's mean loss, the same
-        # number the curve below plots
-        epochs = tqdm(range(EPOCHS), desc="epoch", unit="ep")
-        for epoch in epochs:
-            running = 0.0
-            for train_batch in train_loader:  # fresh (t, noise) draws every epoch
-                step += 1
-                train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
-                loss = gpff_loss(gpff_net(train_batch), train_batch)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                running += loss.item()
-                history.append((step, loss.item()))
-            scheduler.step()
-            epochs.set_postfix(
-                loss=f"{running / len(train_loader):.4f}",
-                lr=f"{scheduler.get_last_lr()[0]:.1e}",
-            )
-        torch.save({"state_dict": gpff_net.state_dict(), "history": history}, CKPT)
 
     gpff_model = gpff_net.eval()  # downstream cells use the *trained* model
 
@@ -654,7 +648,6 @@ def _(DEVICE, HERE, gpff_net, os, process, torch, train_loader):
     loss_ax.set_xlabel("step")
     loss_ax.set_ylabel("weighted pseudo-force MSE")
     loss_ax.grid(alpha=0.3)
-    loss_fig
     return gpff_model, plt, to_device
 
 
@@ -674,11 +667,11 @@ def _(mo):
     four minutes of training.
 
     For comparison the bundle also ships `checkpoints/gpff_big.pt`: a GPFF
-    trained with the same recipe — same pseudo-force target, same linear
-    process to $\sigma_\text{max} = 30$ Å, same $\sigma$-focused time
-    sampling — but at research scale: **5.1M parameters, trained on all
-    ~130k molecules of QM9**. The assembly below is the same
-    `NeuralNetworkPotential` of §6 with bigger numbers in it, and
+    trained the same way — same pseudo-force target, same linear process,
+    same $\sigma$-focused time sampling — but at research scale: **5.1M
+    parameters, trained on all ~130k molecules of QM9**. The assembly below is
+    the same `NeuralNetworkPotential` of §6 with bigger numbers in it (its own
+    150 Å cutoff among them, a property of that run rather than a choice), and
     `USE_BIG_MODEL` swaps it into every sampling and validation cell that
     follows. Flip it after one pass through §7: how far the numbers move is
     the most honest measure of what scale buys.
@@ -689,7 +682,6 @@ def _(mo):
 @app.cell
 def _(
     AtomwiseVector,
-    CUTOFF,
     DEVICE,
     HERE,
     NeuralNetworkPotential,
@@ -699,12 +691,14 @@ def _(
     snn,
     torch,
 ):
+    BIG_CUTOFF = 150.0  # this run's own; its radial basis is built for it
+
     big_net = NeuralNetworkPotential(
         representation=PaiNN(
             n_atom_basis=256,
             n_interactions=4,
-            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=CUTOFF),
-            cutoff_fn=snn.CosineCutoff(CUTOFF),
+            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=BIG_CUTOFF),
+            cutoff_fn=snn.CosineCutoff(BIG_CUTOFF),
             norm_epsilon=1.0,  # this run normalized pair directions as r / (d + 1)
         ),
         input_modules=[PairwiseDistances()],
@@ -738,19 +732,33 @@ def _(big_model, gpff_model):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Direct denoising
+    ### Ancestral sampling
 
-    The pseudo force is the way home in one step: $\hat x_0 = x + F/2$. Taken
-    from pure noise that single jump lands on the model's *conditional mean*
-    over every structure that could hide under it — a blob, not a molecule —
-    so sampling iterates instead: denoise, put a little noise back, repeat.
+    The **classical** route to a sample — the reverse process of the lecture,
+    and what every time-conditioned diffusion model uses — walks a
+    *prescribed* ladder of noise levels
+    $\sigma_N > \sigma_{N-1} > \dots > \sigma_0$ and takes one exact step
+    down each rung.
 
-    That loop is `DirectDenoisingSampler`. At iteration $k$ of $N$ it injects
-    $\lambda\,(1 - k/N)$ of noise before the model call, decaying to zero.
-    There is no time grid and no schedule in it at all: it never asks what
-    noise level its iterate sits at, which is only possible because the model
-    doesn't either. The injected noise is what buys sample diversity;
-    $\lambda = 0$ would be the plain repeated jump.
+    SchNetPack assembles that from four parts, which is the same decomposition
+    as §5's — process and parametrization, plus two that only sampling needs:
+
+    | part | what it decides | here |
+    |---|---|---|
+    | `process` | the noise schedule $\sigma(t)$ | the `VELinear` of §5 |
+    | `parametrization` | what the network's output means | pseudo force |
+    | `integrator` | how one step down the ladder is taken | `Ancestral` |
+    | `grid` | where the rungs sit | uniform in $t$ (the default) |
+
+    `Ancestral` takes the exact step: it converts the prediction into an
+    estimate $\hat x_0$, then draws from the closed-form Gaussian for
+    $x_{\sigma_{k-1}}$ given $x_{\sigma_k}$ and $\hat x_0$ — no approximation
+    beyond the model's own error. On a VE-family process that reduces to the
+    familiar score-form update. On our linear schedule the default uniform
+    grid descends $\sigma$ in equal ~0.15 Å rungs; classic score matching
+    prefers a *geometric* ladder — more rungs where $\sigma$ is small — and
+    the `grid` slot is where such a warp would go (see the outro), one more
+    axis this assembly leaves open.
 
     Two pieces of glue from `helpers.py`. `fully_connected_batch` lays out 8
     copies of our composition as one flat batch — the topology the model needs
@@ -764,15 +772,17 @@ def _(mo):
     rather than a still. A sampler returns the structure it ended on and
     nothing else — but every step passes its state through the model, so
     wrapping the model captures the whole run without the sampler knowing.
-    One box per molecule, as before — they just move now. Scrub the slider: the
-    cloud collapses within the first two or three model calls, and everything
-    after that is the structure being tidied up; the last frame is the sample.
+    One box per molecule, as before — they just move now. Scrub the slider;
+    the frames carry the grid's own times, so the caption reads out the rung
+    each one sits on, $t = 1$ down to $0$: the ladder comes down *gradually*,
+    and the structure only appears over the last handful of rungs.
 
-    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 30$ Å, so
-    the starting cloud is ~80 Å across against a ~3 Å molecule — a 25× range no
-    single camera can hold. The view is framed on the finished structure and
-    pulled back (`zoom=0.35`), so the earliest frames spill past the edges and
-    the atoms fly in from outside. That gap *is* the scale the model closes.
+    One thing to expect on frame 0. The prior is $\sigma_\text{max} = 10$ Å, so
+    the starting cloud is tens of Ångström across against a ~3 Å molecule — a
+    range no single camera can hold. The view is framed on the finished
+    structure and pulled back (`zoom=0.35`), so the earliest frames spill past
+    the edges and the atoms fly in from outside. That gap *is* the scale the
+    model closes.
     """)
     return
 
@@ -790,79 +800,83 @@ def _(
     viz,
 ):
     from helpers import fully_connected_batch, make_model_fn, recording_model_fn
-    from schnetpack.generative import DirectDenoisingSampler
+    from schnetpack.generative import Sampler
+    from schnetpack.generative.integrators import Ancestral
+
+    N_LADDER = 64
 
     torch.manual_seed(2)
     # 8 molecules-to-be, laid out where the model lives
     sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
     model_fn = make_model_fn(gen_model, sampling_batch, "pseudo_force_pred")
-
-    direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=1.0)
-
-    # draw the start from the prior — a 30 Å cloud per molecule — then run
-    # the denoising loop
     n_total = int(sampling_batch[properties.n_atoms].sum())
-    x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
+
+    # process + parametrization as before, plus the two sampling-only parts;
+    # `grid` is left at its default (uniform in t = evenly spaced sigma here)
+    ancestral = Sampler(process, force_param, integrator=Ancestral())
 
     # the sampler returns the final structure only; wrapping the model keeps
     # every state it was asked about, which is the trajectory
-    watched_fn, direct_frames = recording_model_fn(model_fn)
+    watched_anc, ancestral_frames = recording_model_fn(model_fn)
     with torch.no_grad():
-        x_direct = direct.denoise(watched_fn, x_init, n_steps=15)
-    direct_frames.append(x_direct)  # ...plus the structure it ended on
+        x_ancestral = ancestral.sample(
+            watched_anc,
+            shape=(n_total, 3),
+            n_steps=N_LADDER,
+            context=sampling_batch,
+            device=DEVICE,
+        )
+    ancestral_frames.append(x_ancestral)
+
+    # this sampler *does* have a time grid, so the frames can be captioned with
+    # it: the rungs the ladder actually stepped through, t = 1 down to t = 0
+    ladder_t = ancestral.grid(ancestral.t_max, ancestral.t_min, N_LADDER)
 
     # zoom < 1 pulls the camera back: it frames the final molecule, and the
-    # first frames are a 90 Å-wide cloud that should not fly off the panel
-    viz.show_trajectory(direct_frames, sampling_batch, zoom=0.35, cell_px=170)
-    return model_fn, n_total, sampling_batch, x_direct
+    # first frames are a wide noise cloud that should not fly off the panel
+    viz.show_trajectory(
+        ancestral_frames,
+        sampling_batch,
+        times=ladder_t.tolist(),
+        zoom=0.35,
+        cell_px=170,
+        frame_ms=120,  # 65 frames — play them faster than the default
+    )
+    return model_fn, n_total, sampling_batch, x_ancestral
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Ancestral sampling
+    ### Direct denoising
 
-    Direct denoising is GPFF's own sampler, and it is unusual: no schedule, no
-    time grid, nothing that tracks how noisy the iterate is. The **classical**
-    route does the opposite — it walks a *prescribed* ladder of noise levels
-    $\sigma_N > \sigma_{N-1} > \dots > \sigma_0$ and takes one exact step down
-    each rung. This is the reverse process of the lecture, and it is what every
-    time-conditioned diffusion model uses.
+    GPFF's own sampler is unusual: no schedule, no time grid, nothing that
+    tracks how noisy the iterate is. It can afford that because the pseudo
+    force is the way home in *one* step, $\hat x_0 = x + F/2$. Taken from pure
+    noise that single jump lands on the model's *conditional mean* over every
+    structure that could hide under it — a blob, not a molecule — so sampling
+    iterates instead: denoise, re-noise a little, repeat.
 
-    SchNetPack assembles that from four parts, which is the same decomposition
-    as §5's — process and parametrization, plus two that only sampling needs:
+    That loop is `DirectDenoisingSampler`. At iteration $k$ of $N$ it injects
+    $\lambda\,(1 - k/N)$ of noise before the model call, decaying to zero. It
+    never asks what noise level its iterate sits at, which is only possible
+    because the model doesn't either. Here $\lambda = 0$: the plain repeated
+    jump, no injection at all — the deterministic end of the knob, where
+    diversity comes from the starting draw alone. (Raise it and the loop puts
+    noise back between jumps, which buys diversity at the price of needing
+    the schedule to decay it.)
 
-    | part | what it decides | here |
-    |---|---|---|
-    | `process` | the noise schedule $\sigma(t)$ | the `VELinear` of §5 |
-    | `parametrization` | what the network's output means | pseudo force |
-    | `integrator` | how one step down the ladder is taken | `Ancestral` |
-    | `grid` | where the rungs sit | uniform in $t$ (the default) |
+    Compare the two samplers on cost. The ladder above took **64** model
+    calls; this loop takes **15** — schedule-based sampling is the more
+    expensive of the two, which is precisely the pressure that produced
+    methods like GPFF's. Both are `schnetpack.generative` one-liners over the
+    same trained model, so swapping them is a one-line experiment.
 
-    `Ancestral` takes the exact step: it converts the prediction into an
-    estimate $\hat x_0$, then draws from the closed-form Gaussian for
-    $x_{\sigma_{k-1}}$ given $x_{\sigma_k}$ and $\hat x_0$ — no approximation
-    beyond the model's own error. On a VE-family process that reduces to the
-    familiar score-form update. On our linear schedule the default uniform
-    grid descends $\sigma$ in equal ~0.5 Å rungs; classic score matching
-    prefers a *geometric* ladder — more rungs where $\sigma$ is small — and
-    the `grid` slot is where such a warp would go (see the outro), one more
-    axis this assembly leaves open.
-
-    Compare the two samplers on cost. Direct denoising above took **15** model
-    calls; the ladder below takes **64** — schedule-based sampling is the more
-    expensive of the two, which is precisely the pressure that produced methods
-    like GPFF's. Both are `schnetpack.generative` one-liners over the same
-    trained model, so swapping them is a one-line experiment.
-
-    Watch the difference in the movie. Direct denoising is at molecular size
-    after two or three calls and spends everything after that refining; the
-    ladder comes down *gradually* — a quarter of the way in it is still buried
-    at $\sigma \approx 22$ Å, where direct denoising was already at molecular
-    size — and the structure only appears over the last handful of rungs. Same
-    model, same starting noise: the schedule is the only thing that differs.
-    The frames carry the grid's own times, so the caption reads out the rung
-    each one sits on, $t = 1$ to $0$.
+    Watch the difference in the movie. Where the ladder descended gradually
+    and only revealed a structure near the bottom, direct denoising is at
+    molecular size after two or three calls and spends everything after that
+    tidying up; the last frame is the sample. Same model, same starting
+    noise — only the route differs.
     """)
     return
 
@@ -874,46 +888,27 @@ def _(
     model_fn,
     n_total,
     process,
-    properties,
     sampling_batch,
     torch,
     viz,
 ):
     from helpers import recording_model_fn as _rec
-    from schnetpack.generative import Sampler
-    from schnetpack.generative.integrators import Ancestral
-
-    N_LADDER = 64
+    from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
-    # process + parametrization as before, plus the two sampling-only parts;
-    # `grid` is left at its default (uniform in t = evenly spaced sigma here)
-    ancestral = Sampler(process, force_param, integrator=Ancestral())
+    direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=0.0)
 
-    watched_anc, ancestral_frames = _rec(model_fn)
+    # draw the start from the prior — a 10 Å cloud per molecule — then run
+    # the denoising loop
+    x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
+
+    watched_fn, direct_frames = _rec(model_fn)
     with torch.no_grad():
-        x_ancestral = ancestral.sample(
-            watched_anc,
-            shape=(n_total, 3),
-            n_steps=N_LADDER,
-            context=sampling_batch,  # same batch layout as above
-            device=DEVICE,
-        )
-    ancestral_frames.append(x_ancestral)
+        x_direct = direct.denoise(watched_fn, x_init, n_steps=15)
+    direct_frames.append(x_direct)  # ...plus the structure it ended on
 
-    # this sampler *does* have a time grid, so the frames can be captioned with
-    # it: the rungs the ladder actually stepped through, t = 1 down to t = 0
-    ladder_t = ancestral.grid(ancestral.t_max, ancestral.t_min, N_LADDER)
-
-    viz.show_trajectory(
-        ancestral_frames,
-        sampling_batch,
-        times=ladder_t.tolist(),
-        zoom=0.35,
-        cell_px=170,
-        frame_ms=120,  # 65 frames — play them faster than the default
-    )
-    return (x_ancestral,)
+    viz.show_trajectory(direct_frames, sampling_batch, zoom=0.35, cell_px=170)
+    return (x_direct,)
 
 
 @app.cell
@@ -963,8 +958,8 @@ def _(batch, properties, sampling_batch, torch, x_ancestral, x_direct):
 
     {
         "dataset (reference)": geometry_summary(batch[properties.R], batch),
-        "direct denoising (8)": geometry_summary(x_direct, sampling_batch),
         "ancestral (8)": geometry_summary(x_ancestral, sampling_batch),
+        "direct denoising (8)": geometry_summary(x_direct, sampling_batch),
     }
     return
 
@@ -1034,8 +1029,8 @@ def _(batch, properties, sampling_batch, x_ancestral, x_direct):
 
     {
         "dataset (reference)": chemistry_summary(batch[properties.R], batch),
-        "direct denoising (8)": chemistry_summary(x_direct, sampling_batch),
         "ancestral (8)": chemistry_summary(x_ancestral, sampling_batch),
+        "direct denoising (8)": chemistry_summary(x_direct, sampling_batch),
     }
     return
 
@@ -1045,16 +1040,18 @@ def _(mo):
     mo.md(r"""
     ## 8. Your task: a variance-conditioned direct-denoising sampler
 
-    `DirectDenoisingSampler` still marches down a *prescribed* schedule: its
-    injected noise is $\lambda(1 - k/N)$, decided before the run and identical
-    for every molecule in the batch. But a GPFF model reveals the noise level
-    in its own prediction:
+    `DirectDenoisingSampler` runs a *prescribed* number of iterations, and
+    what noise it puts back — $\lambda(1 - k/N)$ — is decided before the run
+    and identical for every molecule in the batch. Above we set $\lambda = 0$
+    and put back nothing at all, which leaves the loop with no notion of how
+    far along it is. But a GPFF model reveals the noise level in its own
+    prediction:
 
     $$\hat\sigma_m = \tfrac{1}{2}\sqrt{\langle F^2 \rangle_m}
       \qquad \text{(per-molecule } \mathrm{RMS}(F)/2\text{)}.$$
 
-    **Write a `DirectDenoisingSampler` subclass that conditions the injection
-    on that estimate instead.** Override `denoise`; per iteration:
+    **Write a `DirectDenoisingSampler` subclass that paces itself by that
+    estimate instead.** Override `denoise`; per iteration:
 
     1. predict the pseudo force $F$ for the current structures;
     2. estimate each molecule's noise level $\hat\sigma_m$ from $F$;
@@ -1096,7 +1093,7 @@ def _(mo):
 
     **Check your implementation against these questions:** how many model
     calls does it take before it stops — and how does that compare with the two
-    fixed budgets above, 15 for direct denoising and 64 for the ladder? What
+    fixed budgets above, 64 for the ladder and 15 for direct denoising? What
     happens for $\kappa \to 1$ and for $\kappa \to 0$? Why is it fine that
     molecules reach $\sigma_\text{min}$ at different iterations?
     """)
