@@ -39,24 +39,25 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-# The paragraph in §1 that only makes sense on a local machine: from the
-# "create an environment" lead-in through the marimo explainer. Anchored on
-# both ends so a reworded middle still matches, and asserted to hit exactly
-# once so a rewrite that breaks the anchors fails loudly instead of silently
-# shipping conda instructions to Colab.
+# The §1 bullets that only make sense on a local machine: from the "run it
+# locally instead" lead-in through the marimo explainer, conda block included.
+# Anchored on both ends so a reworded middle still matches, and asserted to hit
+# exactly once so a rewrite that breaks the anchors fails loudly instead of
+# silently shipping conda instructions to Colab.
 LOCAL_SETUP = re.compile(
-    r"Create an environment.*?works the same in a script\.",
+    r"- \*\*To run it locally instead.*?works the same in a script\.",
     re.DOTALL,
 )
 
+# Replaces them in kind: bullets, so the list §1 is written as stays a list.
 COLAB_SETUP = """\
-Nothing to install by hand: the cell below fetches SchNetPack and the tutorial
-files into this runtime. Run it first — it takes a couple of minutes, and only
-has to happen once per session.
-
-This notebook asks Colab for a **GPU** runtime. If you got one it is used
-automatically; if Colab handed you a CPU instead — free GPUs are rationed and
-not guaranteed — everything still runs, just see *Hardware* below.\
+- **Nothing to install by hand:** the cell below fetches SchNetPack and the
+  tutorial files into this runtime. Run it first; it takes a couple of minutes,
+  and only has to happen once per session.
+- **This notebook asks Colab for a GPU runtime.** If you got one it is used
+  automatically. If Colab handed you a CPU instead, since free GPUs are
+  rationed and not guaranteed, everything still runs, just see *Hardware*
+  below.\
 """
 
 
