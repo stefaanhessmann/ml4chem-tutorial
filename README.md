@@ -15,7 +15,7 @@ PyTorch training loop, and two samplers — ancestral sampling and direct
 denoising — to generate new structures. Ends with two hands-on tasks, both
 steering a sampler without retraining the model: shape-guided direct denoising
 (generate at a prescribed ratio of principal-axis variances) and
-scaffold-conditioned generation (keep an amide anchor, generate the molecule
+scaffold-conditioned generation (keep a `C-C-OH` anchor, generate the molecule
 around it).
 
 The model is **GPFF** (generative pseudo-force field), whose target is a pseudo

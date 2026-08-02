@@ -209,7 +209,9 @@ def _():
 
     if not os.path.exists(DB_PATH):
         db = ASEAtomsData.create(
-            DB_PATH, distance_unit="Ang", property_unit_dict={"energy": "eV"}
+            datapath=DB_PATH,
+            distance_unit="Ang",
+            property_unit_dict={"energy": "eV"},
         )
         db.add_systems(
             atoms_list=molecules,
@@ -257,7 +259,7 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH):
     from schnetpack import properties
 
     dataset = ASEAtomsData(
-        DB_PATH,
+        datapath=DB_PATH,
         load_properties=[],  # skip the stored energies, not needed here
         transforms=[
             trn.SubtractCenterOfGeometry(),
@@ -265,7 +267,7 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH):
             trn.CastTo32(),
         ],
     )
-    loader = AtomsLoader(dataset, batch_size=8, shuffle=False)
+    loader = AtomsLoader(dataset=dataset, batch_size=8, shuffle=False)
     batch = next(iter(loader))
     {
         "R": tuple(batch[properties.R].shape),
@@ -354,7 +356,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
 
     SIGMA_MIN, SIGMA_MAX = 0.05, 30.0  # as the §7 generation model was trained
     CHAIN_IDX = 90  # the most elongated open-chain isomer of the dataset
-    chain = next(iter(AtomsLoader(dataset, sampler=[CHAIN_IDX])))
+    chain = next(iter(AtomsLoader(dataset=dataset, sampler=[CHAIN_IDX])))
     x0 = chain[properties.R]  # the structure every illustration below noises
 
     # the VE process every later section shares
@@ -367,9 +369,9 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
     torch.manual_seed(SEED)
     t_noise = torch.linspace(0.0, 1.0, 13)
     z_noise = torch.randn_like(x0)  # shared draw: only its scale differs
-    frames_vp = [vp.interpolate(x0, vp.prior.std * z_noise, t) for t in t_noise]
+    frames_vp = [vp.interpolate(x0=x0, x1=vp.prior.std * z_noise, t=t) for t in t_noise]
     frames_ve = [
-        ve.interpolate(x0, ve.prior.std * z_noise, t) for t in t_noise
+        ve.interpolate(x0=x0, x1=ve.prior.std * z_noise, t=t) for t in t_noise
     ]
 
     # ghost_id=0: the clean chain stays faintly in place behind xₜ
@@ -438,11 +440,11 @@ def _(SEED, chain, torch, ve, viz, x0):
     t_param = torch.linspace(1.0, 0.2, 13)
     x1_param = ve.prior.sample_like(x0)
     ts_param = [torch.full((len(x0),), float(ti)) for ti in t_param]
-    xt_frames = [ve.interpolate(x0, x1_param, t) for t in ts_param]
+    xt_frames = [ve.interpolate(x0=x0, x1=x1_param, t=t) for t in ts_param]
     targets = {
         # the pseudo force is drawn at half length: F/2 = x0 - x_t is the
         # offset itself, so each arrow lands exactly on the clean structure
-        name: [scale * p.target(ve, x0, x1_param, t) for t in ts_param]
+        name: [scale * p.target(process=ve, x0=x0, x1=x1_param, t=t) for t in ts_param]
         for name, p, scale in (
             ("eps target", eps_param, 1.0),
             ("score target", score_param, 1.0),
@@ -507,16 +509,16 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, ve, trn):
 
     # the forward process, wrapped into the dataset's transform pipeline:
     # train mostly around half an Ångström of displacement, GPFF's density
-    t_sampler = LogNormalSigmaTimes(ve, mean=-0.7, std=1.2, truncate=True)
+    t_sampler = LogNormalSigmaTimes(process=ve, mean=-0.7, std=1.2, truncate=True)
     diffused = ASEAtomsData(
-        DB_PATH,
+        datapath=DB_PATH,
         load_properties=[],
         transforms=[
             trn.SubtractCenterOfGeometry(),
             # the same schedule the frames above walked, sampled where it helps
             Diffuse(
-                ve,
-                force_param,
+                process=ve,
+                parametrization=force_param,
                 t_sampler=t_sampler,
                 label_key="pseudo_force",
                 time_key="t",
@@ -527,7 +529,9 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, ve, trn):
     )
     # a small batch from the pipeline, only so the picture below stays a
     # picture; a hundred viewers on one page is not one
-    diffused_batch = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
+    diffused_batch = next(
+        iter(AtomsLoader(dataset=diffused, batch_size=10, shuffle=True))
+    )
     {key: tuple(diffused_batch[key].shape) for key in ("_positions", "pseudo_force", "t")}
     return CUTOFF, diffused, diffused_batch
 
@@ -625,7 +629,7 @@ def _(CUTOFF, DEVICE, SEED, torch):
             n_atom_basis=128,
             n_interactions=4,
             radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=CUTOFF),
-            cutoff_fn=snn.CosineCutoff(CUTOFF),
+            cutoff_fn=snn.CosineCutoff(cutoff=CUTOFF),
             norm_epsilon=1.0,  # dir_ij = r_ij / (d_ij + 1): smooth at d → 0
         ),
         input_modules=[PairwiseDistances()],
@@ -718,7 +722,7 @@ def _(AtomsLoader, DEVICE, HERE, diffused, gpff_net, os, ve, torch):
         # the whole run as one epoch of STEPS batches, drawn with replacement,
         # which is what lets the workers stay ahead of the GPU (see above)
         train_loader = AtomsLoader(
-            diffused,
+            dataset=diffused,
             batch_size=BATCH,
             sampler=torch.utils.data.RandomSampler(
                 diffused, replacement=True, num_samples=BATCH * STEPS
@@ -739,7 +743,7 @@ def _(AtomsLoader, DEVICE, HERE, diffused, gpff_net, os, ve, torch):
         history = []
         steps = tqdm(train_loader, desc="step", unit="it", total=STEPS)
         for step, train_batch in enumerate(steps):
-            train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
+            train_batch = to_device(batch=train_batch, device=DEVICE)  # CPU-side
             loss = gpff_loss(gpff_net(train_batch), train_batch)
             optimizer.zero_grad()
             loss.backward()
@@ -816,7 +820,7 @@ def _(
             n_atom_basis=256,
             n_interactions=4,
             radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=CUTOFF),
-            cutoff_fn=snn.CosineCutoff(CUTOFF),
+            cutoff_fn=snn.CosineCutoff(cutoff=CUTOFF),
             norm_epsilon=1.0,  # this run normalized pair directions as r / (d + 1)
         ),
         input_modules=[PairwiseDistances()],
@@ -922,20 +926,26 @@ def _(
     torch.manual_seed(SEED)
 
     # 8 molecules-to-be, laid out where the model lives
-    sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
-    model_fn = make_model_fn(gen_model, sampling_batch, "pseudo_force_pred")
+    sampling_batch = to_device(
+        batch=fully_connected_batch(numbers=numbers, n_mol=8), device=DEVICE
+    )
+    model_fn = make_model_fn(
+        model=gen_model, static_batch=sampling_batch, output_key="pseudo_force_pred"
+    )
     n_total = int(sampling_batch[properties.n_atoms].sum())
 
     # process + parametrization as before, plus the two sampling-only parts;
     # `grid` is left at its default (uniform in t = geometric in sigma on VE)
-    ancestral = Sampler(ve, force_param, integrator=Ancestral())
+    ancestral = Sampler(
+        process=ve, parametrization=force_param, integrator=Ancestral()
+    )
 
     # the sampler returns the final structure only; wrapping the model keeps
     # every state it was asked about, which is the trajectory
-    watched_anc, ancestral_frames = recording_model_fn(model_fn)
+    watched_anc, ancestral_frames = recording_model_fn(model_fn=model_fn)
     with torch.no_grad():
         x_ancestral = ancestral.sample(
-            watched_anc,
+            model=watched_anc,
             shape=(n_total, 3),
             n_steps=N_LADDER,
             context=sampling_batch,
@@ -1021,15 +1031,19 @@ def _(
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(SEED)
-    direct = DirectDenoisingSampler(ve, force_param, stochastic_lambda=1.0)
+    direct = DirectDenoisingSampler(
+        process=ve, parametrization=force_param, stochastic_lambda=1.0
+    )
 
     # draw the start from the prior (a 30 Å cloud per molecule), then run
     # the denoising loop
-    x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
+    x_init = direct.prior.sample(
+        shape=(n_total, 3), device=DEVICE, context=sampling_batch
+    )
 
-    watched_fn, direct_frames = recording_model_fn(model_fn)
+    watched_fn, direct_frames = recording_model_fn(model_fn=model_fn)
     with torch.no_grad():
-        x_direct = direct.denoise(watched_fn, x_init, n_steps=60)
+        x_direct = direct.denoise(model=watched_fn, x_t=x_init, n_steps=60)
     direct_frames.append(x_direct)  # ...plus the structure it ended on
 
     viz.show_trajectory(
@@ -1172,8 +1186,12 @@ def _(
 ):
     # §7's layout again, ten molecules wide this time, and bound to the
     # research-scale model whatever USE_BIG_MODEL says
-    task_batch = to_device(fully_connected_batch(numbers, n_mol=10), DEVICE)
-    task_model_fn = make_model_fn(big_model, task_batch, "pseudo_force_pred")
+    task_batch = to_device(
+        batch=fully_connected_batch(numbers=numbers, n_mol=10), device=DEVICE
+    )
+    task_model_fn = make_model_fn(
+        model=big_model, static_batch=task_batch, output_key="pseudo_force_pred"
+    )
     n_task = int(task_batch[properties.n_atoms].sum())
     return n_task, task_batch, task_model_fn
 
@@ -1183,60 +1201,34 @@ def _(mo):
     mo.md(r"""
     ### a) Shape-guided direct denoising
 
-    **Shape** (rod, disc, ball) is a property of the atom cloud rather than
-    of its chemistry, and three numbers hold it. Center a structure and form
-    the 3×3 covariance of its positions:
+    **Generate molecules of a prescribed shape**: a rod, a disc, a ball.
 
-    $$C = \frac{1}{n}\sum_i x_i x_i^\top
-        = V \operatorname{diag}(\lambda_1 \ge \lambda_2 \ge \lambda_3) V^\top .$$
+    A structure's shape lives in the spread of its atoms along its three
+    principal axes, and `SHAPE_TARGET` says how that spread should be divided
+    between them. Stretching the cloud along one axis and squeezing it along
+    another is a rotation and a rescaling away, and `torch.linalg.eigh` gives
+    you the axes.
 
-    - the columns of $V$ are the **principal axes**, $\lambda_i$ the variance
-      along each;
-    - $\operatorname{tr} C = \sum_i \lambda_i$ is the mean squared distance
-      from the center, the structure's **size**;
-    - $r_i = \lambda_i / \operatorname{tr} C$ is its **shape**: unchanged by
-      rotation, and independent of size.
+    **What to do**, two `# TODO`s in the next cell:
 
-    Our 181 isomers run from $r = (0.41, 0.33, 0.26)$, the roundest of them, to
-    $(0.89, 0.09, 0.02)$, the open chain §5 kept noising, and $r_3$ averages
-    $0.03$, which is these molecules saying they are flat.
+    - **Write `reshape`.** Per molecule, centered: find the principal axes,
+      rescale along each so the spread matches the target, keeping the overall
+      size unchanged.
+    - **Call it inside the loop**, so the model always sees the reshaped state.
 
-    **Your task: make the sampler generate at a prescribed $r^\ast$.** Once per
-    iteration, *before* the model is called, stretch and squeeze the current
-    structure onto the target: eigendecompose its covariance, then scale along
-    principal axis $i$ by
-
-    $$s_i = \sqrt{\frac{r_i^\ast \operatorname{tr} C}{\lambda_i}},
-      \qquad x \;\leftarrow\; V \operatorname{diag}(s)\, V^\top x,$$
-
-    and hand *that* to the model.
-
-    Since $\sum_i r_i^\ast = 1$, the new variances again sum to
-    $\operatorname{tr} C$: the map **preserves the total** and only moves
-    variance between axes. That restriction keeps the task well-posed: total
-    variance is fixed by bond lengths and atom count, neither of which you are
-    free to choose, and a guidance that inflated it too would be demanding a
-    molecule whose bonds are 20% too long.
-
-    Why before *every* call rather than once on the finished sample? Applied
-    once, this is not guidance but damage: every bond along the long axis
-    stretched by $s_1$, and the validity check will say so. Applied every
-    iteration, each squeeze is small and the denoising step right after repairs
-    it, toward a structure already leaning the way you asked.
-
-    **Two `# TODO`s in the next cell:** write `reshape`, then call it in the
-    loop. The movie is the measurement, since a rod and a ball are not subtle,
-    and each panel is captioned with the molecule its structure turned out to be.
+    Nudging then denoising, every iteration, is what keeps the result a
+    molecule: each squeeze is small and the model call right after repairs it.
+    The movie is the measurement, and each panel is captioned with whatever
+    molecule came out.
 
     **Then ask:**
 
     - Does the batch come out the shape you asked for, and which target does
-      the model fight hardest? Try `SHAPE_TARGET` as the disc and the ball, and
-      hold all three against the dataset's range above.
+      the model fight hardest? Try `SHAPE_TARGET` as the disc and the ball.
     - On the ball run, read the molecule names: a planar ring cannot fill three
       dimensions, so what does the model reach for instead?
-    - Drop the trace preservation and scale the total variance by 1.5 as well.
-      What breaks, and at which point in the loop does it show?
+    - Let the total size grow as well, not just its division between axes.
+      What breaks?
     - Reshape *only once*, on the finished sample. What happens to the names?
     """)
     return
@@ -1250,7 +1242,7 @@ def _(DirectDenoisingSampler, torch):
         def __init__(
             self, process, parametrization, idx_m, n_atoms, target, **kwargs
         ):
-            super().__init__(process, parametrization, **kwargs)
+            super().__init__(process=process, parametrization=parametrization, **kwargs)
             self.idx_m = idx_m  # which molecule each row belongs to
             self.n_mol = int(n_atoms.shape[0])
             target = torch.as_tensor(target, dtype=torch.float32)
@@ -1265,10 +1257,10 @@ def _(DirectDenoisingSampler, torch):
                 pos = x[rows]
                 pos = pos - pos.mean(0)  # each molecule on its own center
                 # TODO ------------------------------------------------------
-                # Eigendecompose this molecule's 3x3 covariance
-                # (`torch.linalg.eigh` returns ascending eigenvalues and the
-                # matching axes as *columns*), build the per-axis factor s_i of
-                # the formula above, and write the rescaled positions back.
+                # Find this molecule's principal axes and how far it spreads
+                # along each (`torch.linalg.eigh` of the covariance: ascending
+                # spreads, axes as *columns*), rescale so the spread matches
+                # `self.target` without changing the total, and write it back.
                 out[rows] = pos  # as shipped: no reshaping at all
                 # -----------------------------------------------------------
             return out
@@ -1284,7 +1276,7 @@ def _(DirectDenoisingSampler, torch):
                 # TODO: one line. The state that goes into the model should be
                 # the reshaped one
                 x = self.parametrization.to_x0(
-                    self.process, model(x, t, cond), x, t
+                    process=self.process, output=model(x, t, cond), x_t=x, t=t
                 )
             return x
 
@@ -1300,7 +1292,7 @@ def _(DirectDenoisingSampler, torch):
         def __init__(
             self, process, parametrization, idx_m, n_atoms, target, **kwargs
         ):
-            super().__init__(process, parametrization, **kwargs)
+            super().__init__(process=process, parametrization=parametrization, **kwargs)
             self.idx_m = idx_m
             self.n_mol = int(n_atoms.shape[0])
             target = torch.as_tensor(target, dtype=torch.float32)
@@ -1330,7 +1322,7 @@ def _(DirectDenoisingSampler, torch):
                     x = x + noise_scale * torch.randn_like(x)
                 x = self.reshape(x)  # the model only ever sees the target shape
                 x = self.parametrization.to_x0(
-                    self.process, model(x, t, cond), x, t
+                    process=self.process, output=model(x, t, cond), x_t=x, t=t
                 )
             return x
 
@@ -1364,10 +1356,12 @@ def _(
         task_batch[properties.n_atoms],
         SHAPE_TARGET,
     )
-    x_start = shaped.prior.sample((n_task, 3), device=DEVICE, context=task_batch)
-    watched, shape_frames = recording_model_fn(task_model_fn)
+    x_start = shaped.prior.sample(
+        shape=(n_task, 3), device=DEVICE, context=task_batch
+    )
+    watched, shape_frames = recording_model_fn(model_fn=task_model_fn)
     with torch.no_grad():
-        x_shaped = shaped.denoise(watched, x_start, n_steps=60)
+        x_shaped = shaped.denoise(model=watched, x_t=x_start, n_steps=60)
     shape_frames.append(x_shaped)
 
     viz.show_trajectory(
@@ -1391,66 +1385,53 @@ def _(mo):
     a group that binds or a core a synthesis route exists for, and what is
     wanted is everything around it.
 
-    Ours is the **amide**, `N-C(=O)`: the peptide bond, and the single most
-    common linkage in drug molecules. It is taken from
-    3-(hydroxyimino)pyrrolidin-2-one, a small QM9 lactam, and it is *all* that
-    is kept: four atoms of fourteen, three of them heavy. Everything else is
-    generated: **5 of the 8 heavy atoms are free**, so the model is not
-    decorating a fixed core here, it is building a molecule around an anchor.
+    Ours is an **alcohol**, `C-C-OH`, taken from 1-octanol — a plain
+    eight-carbon chain with a hydroxyl on the end. Two carbons, the oxygen and
+    its hydrogen are kept; the other 23 atoms, **6 of the 9 heavy ones**, are
+    generated. So the model is not decorating a fixed core here, it is building
+    a molecule around an anchor, and what comes back are different C₈H₁₈O
+    skeletons wearing the same alcohol.
 
-    That is deliberate. Freeze more and the model mostly re-derives the
-    molecule you took the scaffold from; freeze this little and each run is a
-    different molecule that happens to contain your amide, which is what
-    fragment-based design actually looks like.
+    The next cell states the scaffold as three arrays, positions, atomic
+    numbers and the indices to keep, since that is all a scaffold is. It leaves
+    you `scaffold_batch` (the layout), `scaffold_model_fn` (the model bound to
+    it), `x_kept` (the coordinates) and `free_atoms` (the rows a sampler may
+    touch).
 
-    The molecule comes from QM9 rather than from our 181 isomers, so the next
-    cell simply *states* it as three arrays: positions in Å (already centered),
-    atomic numbers, and the indices to keep. That is all a scaffold is. It
-    works because §8 samples with the model trained on all of QM9, which knows
-    this composition even though §3's dataset never mentions it.
+    **Generate molecules that contain the given scaffold, in its given
+    geometry.** Two things have to change, and the sampler as shipped does
+    neither: it starts every atom in noise and moves every atom every step.
 
-    That cell also draws the molecule with its atom indices on, and leaves you
-    four things: `scaffold_batch` (the layout, in this molecule's atom order),
-    `scaffold_model_fn` (the model bound to it), `x_kept` (the coordinates,
-    repeated per copy) and `free_atoms` (the mask of rows a sampler may touch).
+    **What to do**, three `# TODO`s in the next cell:
 
-    Two axes carry the task, one each.
+    - **Start right.** The prior decides where a run begins. Draw the free
+      atoms from noise as usual, but place the kept ones at their coordinates.
+    - **Keep them there.** Inside the loop, exclude the scaffold rows from the
+      noise injection and from the update, so only the free atoms move.
 
-    **The prior.** §5 named it as an axis it does not vary; vary it here.
-    `GaussianPrior` draws every atom from $\mathcal N(0, \sigma_\text{max}^2)$;
-    a **scaffold prior** draws only the *free* rows that way and puts the kept
-    atoms at their given coordinates. That is a legal prior, and the library's
-    rule says why. An endpoint may depend on anything known before generation
-    (composition, atom count, which atoms are fixed and where) but never on the
-    data values of the batch it is generating. So `ScaffoldPrior` subclasses
-    `Prior` and is handed to the sampler as `prior=`, exactly like the process
-    and the parametrization.
-
-    **The sampler.** A prior only decides where the run *starts*; the first
-    model call would move the amide like anything else. So freeze it: after
-    every update write the scaffold coordinates back, and keep the noise
-    injection off those rows too. The free atoms then see an anchor that never
-    moves, and assemble around it.
-
-    **Three `# TODO`s in the next cell.** As shipped, the prior is an ordinary
-    Gaussian and nothing is frozen, so the amide drifts off with everything
-    else and each run is an unconditional sample. Get all three right and the
-    anchor stands still through the whole movie while the other ten atoms fly
-    in around it.
+    Get it right and the anchor stands still through the whole movie while the
+    other 23 atoms assemble around it.
 
     **Then ask:**
 
-    - Read the panel captions: how many completions still contain the amide,
-      and what did the model build onto it, rings or chains? None of them has to
-      be the molecule the fragment came from, and most will not be.
+    - Read the panel captions: they are alcohols, but which ones? Straight
+      chains, branched ones, 1-octanol itself? None of them has to be the
+      molecule the fragment came from, and most will not be. Watch for the odd
+      one where the oxygen ends up *inside* the chain as an ether — the anchor
+      pins three atoms, not what they are bonded to.
+    - Seventeen of the free atoms are hydrogens, and RDKit only calls a
+      structure a molecule if every one lands within bonding distance. That is
+      why this task runs longer and quieter than §7: 150 iterations at half the
+      noise injection. Put both back to §7's values (60 and 1.0) and count what
+      survives.
     - This start is **out of distribution**: the model was trained where every
       atom carries the *same* noise level, and here four atoms are exact while
-      ten sit 30 Å out. Does that show, and does starting the free atoms at a
+      23 sit 30 Å out. Does that show, and does starting the free atoms at a
       smaller `std` (3 Å, say) buy better completions, or only less diverse
       ones?
-    - Freeze more: add the ring carbon next to the amide, or the whole ring.
-      How much structure does the model need before it stops inventing and
-      starts reconstructing?
+    - Freeze more: keep the next carbon along the chain too, or half of it. How
+      much structure does the model need before it stops inventing and starts
+      reconstructing?
     """)
     return
 
@@ -1469,32 +1450,53 @@ def _(
 ):
     # 3-(hydroxyimino)pyrrolidin-2-one, one QM9 structure written out in full:
     # nothing here needs the dataset, and a scaffold is only ever these arrays.
-    SCAFFOLD_Z = np.array([8, 7, 6, 6, 6, 7, 6, 8, 1, 1, 1, 1, 1, 1])
+    SCAFFOLD_Z = np.array(
+        # fmt: off
+        [6, 6, 6, 6, 6, 6, 6, 6, 8,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        # fmt: on
+    )
     SCAFFOLD_R = np.array(  # positions in Angstrom, center of geometry at 0
         [
-            [1.73577, 2.33192, -0.19861],  # 0   O, oxime
-            [1.79019, 0.95051, -0.14187],  # 1   N, oxime
-            [0.66031, 0.39076, 0.04573],  # 2   C, ring
-            [0.53740, -1.11094, 0.13951],  # 3   C, ring
-            [-0.96261, -1.36931, -0.13537],  # 4   C, ring
-            [-1.57289, -0.08586, 0.16992],  # 5   N, amide  <- kept
-            [-0.72108, 0.99488, 0.17524],  # 6   C, amide  <- kept
-            [-1.04806, 2.15558, 0.26989],  # 7   O, amide  <- kept
-            [2.65830, 2.56393, -0.35520],  # 8   H, on the oxime O
-            [1.19530, -1.63266, -0.55682],  # 9   H, on C3
-            [0.79316, -1.44270, 1.15216],  # 10  H, on C3
-            [-1.13046, -1.65728, -1.18229],  # 11  H, on C4
-            [-1.36859, -2.16296, 0.49881],  # 12  H, on C4
-            [-2.56675, 0.07413, 0.11890],  # 13  H, on the amide N  <- kept
+            [-1.21787, 4.08052, 2.08149],  # 0   C, the far end of the chain
+            [-1.17900, 2.55043, 2.04083],  # 1   C
+            [-0.47184, 1.99695, 0.79893],  # 2   C
+            [-0.42804, 0.46613, 0.74944],  # 3   C
+            [0.27930, -0.08542, -0.49288],  # 4   C
+            [0.32289, -1.61667, -0.54188],  # 5   C
+            [1.03114, -2.16083, -1.78589],  # 6   C   <- kept
+            [1.07236, -3.68214, -1.83112],  # 7   C   <- kept, carries the OH
+            [1.74801, -4.07032, -3.01888],  # 8   O   <- kept
+            [-0.20643, 4.50216, 2.07927],  # 9   H, on C0
+            [-1.74468, 4.48618, 1.21045],  # 10  H, on C0
+            [-1.72828, 4.44535, 2.97846],  # 11  H, on C0
+            [-0.67681, 2.17219, 2.94129],  # 12  H, on C1
+            [-2.20337, 2.15633, 2.07912],  # 13  H, on C1
+            [-0.97369, 2.37580, -0.10268],  # 14  H, on C2
+            [0.55333, 2.39161, 0.75979],  # 15  H, on C2
+            [0.07390, 0.08792, 1.65122],  # 16  H, on C3
+            [-1.45342, 0.07210, 0.78862],  # 17  H, on C3
+            [-0.22238, 0.29168, -1.39487],  # 18  H, on C4
+            [1.30472, 0.30755, -0.53245],  # 19  H, on C4
+            [0.82466, -1.99299, 0.36072],  # 20  H, on C5
+            [-0.70313, -2.00885, -0.50216],  # 21  H, on C5
+            [0.53088, -1.80043, -2.69335],  # 22  H, on C6
+            [2.06088, -1.78477, -1.82911],  # 23  H, on C6
+            [1.58879, -4.06678, -0.93582],  # 24  H, on C7
+            [0.04512, -4.08270, -1.80869],  # 25  H, on C7
+            [1.77295, -5.03099, -3.04987],  # 26  H, on the O  <- kept
         ]
     )
-    SCAFFOLD = np.array([5, 6, 7, 13])  # the amide N-C(=O) and its hydrogen
+    SCAFFOLD = np.array([6, 7, 8, 26])  # C-C-OH: two carbons, the oxygen, its H
     N_SCAFFOLD = 10  # completions to generate
 
     scaffold_batch = to_device(
-        fully_connected_batch(SCAFFOLD_Z.tolist(), n_mol=N_SCAFFOLD), DEVICE
+        batch=fully_connected_batch(numbers=SCAFFOLD_Z.tolist(), n_mol=N_SCAFFOLD),
+        device=DEVICE,
     )
-    scaffold_model_fn = make_model_fn(big_model, scaffold_batch, "pseudo_force_pred")
+    scaffold_model_fn = make_model_fn(
+        model=big_model, static_batch=scaffold_batch, output_key="pseudo_force_pred"
+    )
 
     # the same anchor in every copy...
     x_kept = (
@@ -1506,11 +1508,11 @@ def _(
     free_atoms = (~kept).repeat(N_SCAFFOLD).to(DEVICE)
 
     # the same arrays as one molecule, only to look at
-    scaffold_view = fully_connected_batch(SCAFFOLD_Z.tolist(), n_mol=1)
+    scaffold_view = fully_connected_batch(numbers=SCAFFOLD_Z.tolist(), n_mol=1)
     scaffold_view[properties.R] = torch.tensor(SCAFFOLD_R, dtype=torch.float32)
     viz.show_batch(
         scaffold_view,
-        titles=["keep the amide 5, 6, 7 and its hydrogen 13, generate the rest"],
+        titles=["keep C-C-OH — atoms 6, 7, 8 and the hydroxyl H 26"],
         atom_index=True,
         cell_px=300,
         zoom=1.5,
@@ -1544,7 +1546,7 @@ def _(DirectDenoisingSampler, torch):
                 device=device or self.x_scaffold.device,
             )
             # the same zero-COM frame everything else lives in, per molecule
-            x = GaussianPrior.center(x, self.idx_m)
+            x = GaussianPrior.center(x=x, segments=self.idx_m)
             # TODO: the free rows start as noise, the scaffold rows start at
             # the coordinates they are supposed to keep (`torch.where`)
             return x
@@ -1553,7 +1555,7 @@ def _(DirectDenoisingSampler, torch):
         """Direct denoising in which the scaffold rows never move."""
 
         def __init__(self, process, parametrization, x_scaffold, free, **kwargs):
-            super().__init__(process, parametrization, **kwargs)
+            super().__init__(process=process, parametrization=parametrization, **kwargs)
             self.x_scaffold, self.free = x_scaffold, free[:, None]
 
         def denoise(self, model, x_t, n_steps, cond=None):
@@ -1565,7 +1567,7 @@ def _(DirectDenoisingSampler, torch):
                     # TODO: the scaffold does not move, not even by the injection
                     x = x + noise_scale * torch.randn_like(x)
                 x0_hat = self.parametrization.to_x0(
-                    self.process, model(x, t, cond), x, t
+                    process=self.process, output=model(x, t, cond), x_t=x, t=t
                 )
                 # TODO: only the free rows take the update
                 x = x0_hat
@@ -1595,14 +1597,14 @@ def _(DirectDenoisingSampler, torch):
                 dtype=dtype or self.x_scaffold.dtype,
                 device=device or self.x_scaffold.device,
             )
-            x = _GaussianPrior.center(x, self.idx_m)
+            x = _GaussianPrior.center(x=x, segments=self.idx_m)
             return torch.where(self.free, x, self.x_scaffold)
 
     class ScaffoldDenoisingSolution(DirectDenoisingSampler):
         """The same sampler with both TODOs filled in."""
 
         def __init__(self, process, parametrization, x_scaffold, free, **kwargs):
-            super().__init__(process, parametrization, **kwargs)
+            super().__init__(process=process, parametrization=parametrization, **kwargs)
             self.x_scaffold, self.free = x_scaffold, free[:, None]
 
         def denoise(self, model, x_t, n_steps, cond=None):
@@ -1614,7 +1616,7 @@ def _(DirectDenoisingSampler, torch):
                     # the scaffold does not move, not even by the injection
                     x = x + noise_scale * torch.randn_like(x) * self.free
                 x0_hat = self.parametrization.to_x0(
-                    self.process, model(x, t, cond), x, t
+                    process=self.process, output=model(x, t, cond), x_t=x, t=t
                 )
                 x = torch.where(self.free, x0_hat, self.x_scaffold)
             return x
@@ -1651,12 +1653,16 @@ def _(
         x_kept,
         free_atoms,
         prior=PRIOR(x_kept, free_atoms, scaffold_batch[properties.idx_m], SIGMA_MAX),
-        stochastic_lambda=1.0,
+        # 23 free atoms is a lot to place: half the injection of §7, over more
+        # iterations, roughly doubles how many completions come out as molecules
+        stochastic_lambda=0.5,
     )
-    watched_scaffold, scaffold_frames = recording_model_fn(scaffold_model_fn)
+    watched_scaffold, scaffold_frames = recording_model_fn(
+        model_fn=scaffold_model_fn
+    )
     with torch.no_grad():
         x_scaffold = scaffolded.sample(
-            watched_scaffold, shape=x_kept.shape, n_steps=60, device=DEVICE
+            model=watched_scaffold, shape=x_kept.shape, n_steps=150, device=DEVICE
         )
     scaffold_frames.append(x_scaffold)
 
@@ -1664,6 +1670,7 @@ def _(
         scaffold_frames,
         scaffold_batch,
         titles=smiles_per_molecule(x_scaffold, scaffold_batch),
+        stride=3,  # 150 iterations is more frames than a scrubber needs
         zoom=0.35,
         cell_px=190,
         frame_ms=120,
