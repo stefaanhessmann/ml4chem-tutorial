@@ -30,7 +30,7 @@ def _(mo):
     5. **Data augmentation** — noising structures, defining labels
     6. **Model architecture and training** — a force field on noised structures
     7. **Sampling** — direct denoising, ancestral sampling, and checking what we made
-    8. **Your task** — a variance-conditioned sampler
+    8. **Your tasks** — steering the sampler: shape guidance and scaffolds
 
     ## 1. Setup
 
@@ -42,8 +42,8 @@ def _(mo):
     ├── data/
     │   └── qm9_c4h4n2o2.xyz   ← the dataset: 181 small molecules from QM9
     ├── checkpoints/
+    │   ├── gpff.pt            ← the §6 model; that cell loads it unless RETRAIN = True
     │   └── gpff_big.pt        ← a GPFF at research scale (all of QM9); §7's switch swaps it in
-    │                            — the §6 model is trained live, not shipped
     ├── helpers.py             ← small glue code (batch adapters for sampling)
     ├── viz.py                 ← 3D molecule viewer
     └── assets/3Dmol-min.js    ← vendored viewer library (works offline)
@@ -66,9 +66,10 @@ def _(mo):
 
     **Hardware.** The first code cell sets `DEVICE` to a GPU when one is
     available and to the CPU otherwise; the model and every batch follow it,
-    and nothing below is device-specific. The GPU matters in exactly one
-    place — §6's training run, a few minutes there against the better part of
-    an hour on a CPU; everything else is comfortable either way.
+    and nothing below is device-specific. Everything here is comfortable on
+    either: §6 ships its trained model, so the one genuinely GPU-hungry step —
+    training it yourself, with `RETRAIN = True` — is opt-in. That one is
+    roughly ten minutes on a GPU and much longer on a CPU.
     """)
     return
 
@@ -312,7 +313,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
         ghost_id=0,
         panel_labels=("x₀ (data)", "xₜ", "x₁ (prior)"),
     )
-    return SIGMA_MIN, chain, process, x0
+    return SIGMA_MAX, chain, process, x0
 
 
 @app.cell
@@ -329,8 +330,9 @@ def _(mo):
     direction and distance straight back to the clean structure, so getting
     home is one addition, $\hat x_0 = x_t + F/2$. And because its magnitude
     *carries* the noise level, a GPFF network needs **no time input at all** —
-    remember this for §6, and the second identity for §8, where we ask a
-    trained model *how noisy is this structure?*
+    remember this for §6. The second identity is that fact read backwards: a
+    trained GPFF can be *asked* how noisy a structure is, by measuring how long
+    the arrows are that it draws on it.
 
     The lecture introduced the alternatives, and the library has them too:
     `EpsParametrization` predicts the unit noise that was mixed in (same
@@ -392,10 +394,11 @@ def _(chain, process, torch, viz, x0):
 @app.cell
 def _(mo):
     mo.md(r"""
-    Two further axes exist that this tutorial does not vary: the **coupling**
+    Two further axes exist that this section does not vary: the **coupling**
     (how the drawn $(x_0, x_1)$ pairs are matched up) and the **prior** (what
-    $x_1$ is drawn from) — equally swappable constructor arguments; see the
-    `schnetpack.generative` API docs.
+    $x_1$ is drawn from) — equally swappable constructor arguments. The prior
+    comes back in §8b, where replacing it is half the task; the coupling stays
+    for the `schnetpack.generative` API docs.
 
     ### Wrapping it into a transform
 
@@ -633,36 +636,29 @@ def _(mo):
     visited: a few thousand steps is a noisy place to stop, and the averaged
     model samples visibly better than whichever iterate happened to be last.
 
-    No checkpoint for this one — the cell below *is* the training run: a few
-    minutes on a GPU and the better part of an hour on a CPU, the one place in
-    this notebook the hardware genuinely matters. Re-running the cell trains
-    again from scratch. Don't over-read the loss curve: it plateaus well above
-    zero because every noise level keeps an irreducible error — that is
-    healthy.
+    The cell below **loads** that run by default, from
+    `checkpoints/gpff.pt` — twelve thousand steps is a quarter of an hour on a
+    laptop GPU and considerably worse on a CPU, which is a long time to sit and
+    watch. Set `RETRAIN = True` to run it yourself instead; the loop is right
+    there, and it overwrites the checkpoint when it finishes. Either way the
+    curve below is real: the checkpoint stores its loss history alongside its
+    weights. Don't over-read it — it plateaus well above zero because every
+    noise level keeps an irreducible error, and that is healthy.
     """)
     return
 
 
 @app.cell
-def _(AtomsLoader, DEVICE, diffused, gpff_net, process, torch):
+def _(AtomsLoader, DEVICE, HERE, diffused, gpff_net, os, process, torch):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
 
     from helpers import to_device
 
-    STEPS, BATCH, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
+    CKPT = os.path.join(HERE, "checkpoints", "gpff.pt")
+    RETRAIN = False  # True: run the loop below instead of loading the checkpoint
 
-    # the whole run as one epoch of STEPS batches, drawn with replacement —
-    # which is what lets the workers stay ahead of the GPU (see above)
-    train_loader = AtomsLoader(
-        diffused,
-        batch_size=BATCH,
-        sampler=torch.utils.data.RandomSampler(
-            diffused, replacement=True, num_samples=BATCH * STEPS
-        ),
-        num_workers=4,
-        persistent_workers=True,
-    )
+    STEPS, BATCH, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
 
     def gpff_loss(pred, inputs):
         # 1/sigma^2 undoes the label's sigma-scaling; the ceiling keeps the
@@ -671,35 +667,56 @@ def _(AtomsLoader, DEVICE, diffused, gpff_net, process, torch):
         diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
         return (weight[:, None] * diff**2).mean()
 
-    optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
-    # decay the step size geometrically from LR_START to LR_END across the
-    # run — so the last steps only polish
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=(LR_END / LR_START) ** (1 / STEPS)
-    )
-    # the running average of the weights, which is what samples at the end
-    ema = {key: v.detach().clone().float() for key, v in gpff_net.state_dict().items()}
+    if os.path.exists(CKPT) and not RETRAIN:
+        # the checkpoint carries its loss curve as well as its weights, so the
+        # plot below is the real one from the run that produced them
+        ckpt_state = torch.load(CKPT, weights_only=True, map_location=DEVICE)
+        gpff_net.load_state_dict(ckpt_state["state_dict"])
+        history = [tuple(h) for h in ckpt_state["history"]]
+    else:
+        # the whole run as one epoch of STEPS batches, drawn with replacement —
+        # which is what lets the workers stay ahead of the GPU (see above)
+        train_loader = AtomsLoader(
+            diffused,
+            batch_size=BATCH,
+            sampler=torch.utils.data.RandomSampler(
+                diffused, replacement=True, num_samples=BATCH * STEPS
+            ),
+            num_workers=4,
+            persistent_workers=True,
+        )
 
-    history = []
-    steps = tqdm(train_loader, desc="step", unit="it", total=STEPS)
-    for step, train_batch in enumerate(steps):
-        train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
-        loss = gpff_loss(gpff_net(train_batch), train_batch)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        with torch.no_grad():
-            for key, value in gpff_net.state_dict().items():
-                ema[key].mul_(EMA_DECAY).add_(value.float(), alpha=1.0 - EMA_DECAY)
+        optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
+        # decay the step size geometrically from LR_START to LR_END across the
+        # run — so the last steps only polish
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=(LR_END / LR_START) ** (1 / STEPS)
+        )
+        # the running average of the weights, which is what samples at the end
+        ema = {k: v.detach().clone().float() for k, v in gpff_net.state_dict().items()}
 
-        history.append((step, loss.item()))
-        if step % 50 == 0:
-            steps.set_postfix(
-                loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.1e}"
-            )
+        history = []
+        steps = tqdm(train_loader, desc="step", unit="it", total=STEPS)
+        for step, train_batch in enumerate(steps):
+            train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
+            loss = gpff_loss(gpff_net(train_batch), train_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            with torch.no_grad():
+                for key, value in gpff_net.state_dict().items():
+                    ema[key].mul_(EMA_DECAY).add_(value.float(), alpha=1.0 - EMA_DECAY)
 
-    gpff_net.load_state_dict({key: v.to(DEVICE) for key, v in ema.items()})
+            history.append((step, loss.item()))
+            if step % 50 == 0:
+                steps.set_postfix(
+                    loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.1e}"
+                )
+
+        gpff_net.load_state_dict({key: v.to(DEVICE) for key, v in ema.items()})
+        torch.save({"state_dict": gpff_net.state_dict(), "history": history}, CKPT)
+
     gpff_model = gpff_net.eval()  # downstream cells use the *trained* model
 
     loss_fig, loss_ax = plt.subplots(figsize=(6, 3))
@@ -718,15 +735,15 @@ def _(mo):
 
     ### The model that generates
 
-    Everything from here on — both samplers and your task in §8 — runs on the
+    Everything from here on — both samplers and your tasks in §8 — runs on the
     model §6 just trained, a **teaching-sized** network on 181 structures.
     Denoising has to be accurate exactly where geometry is decided, at
     $\sigma \lesssim 0.3$ Å where bond lengths live — which is precisely
     where the time sampler concentrated its training. How well that worked is
     what the validation cells below measure; don't expect perfection from a
-    few minutes of training on 181 molecules. Roughly half of what it draws is
+    model this size trained on 181 molecules. Roughly half of what it draws is
     a chemically valid molecule, and essentially all of it is sane geometry —
-    which, for a model this size, is the honest answer.
+    which, at this scale, is the honest answer.
 
     For comparison the bundle also ships `checkpoints/gpff_big.pt`: a GPFF
     trained the same way — same pseudo-force target, same VE process, same
@@ -902,7 +919,15 @@ def _(
         cell_px=170,
         frame_ms=120,  # 65 frames — play them faster than the default
     )
-    return model_fn, n_total, sampling_batch, x_ancestral
+    return (
+        fully_connected_batch,
+        make_model_fn,
+        model_fn,
+        n_total,
+        recording_model_fn,
+        sampling_batch,
+        x_ancestral,
+    )
 
 
 @app.cell
@@ -957,11 +982,11 @@ def _(
     model_fn,
     n_total,
     process,
+    recording_model_fn,
     sampling_batch,
     torch,
     viz,
 ):
-    from helpers import recording_model_fn as _rec
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
@@ -971,7 +996,7 @@ def _(
     # the denoising loop
     x_init = direct.prior.sample((n_total, 3), device=DEVICE, context=sampling_batch)
 
-    watched_fn, direct_frames = _rec(model_fn)
+    watched_fn, direct_frames = recording_model_fn(model_fn)
     with torch.no_grad():
         x_direct = direct.denoise(watched_fn, x_init, n_steps=60)
     direct_frames.append(x_direct)  # ...plus the structure it ended on
@@ -979,7 +1004,7 @@ def _(
     viz.show_trajectory(
         direct_frames, sampling_batch, zoom=0.35, cell_px=170, frame_ms=120
     )
-    return (x_direct,)
+    return DirectDenoisingSampler, x_direct
 
 
 @app.cell
@@ -1103,70 +1128,50 @@ def _(batch, properties, sampling_batch, x_ancestral, x_direct):
         "ancestral (8)": chemistry_summary(x_ancestral, sampling_batch),
         "direct denoising (8)": chemistry_summary(x_direct, sampling_batch),
     }
-    return
+    return (rdkit_verdict,)
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 8. Your task: a variance-conditioned direct-denoising sampler
+    ## 8. Your tasks: steering the sampler
 
-    `DirectDenoisingSampler` runs a *prescribed* number of iterations, and
-    what noise it puts back — $\lambda(1 - k/N)$ — is decided before the run
-    and identical for every molecule in the batch: the same 60 iterations and
-    the same decay whether a structure is already nearly clean or still a
-    cloud. The loop has no notion of how far along any of them is. But a GPFF
-    model reveals the noise level in its own prediction:
+    Both samplers of §7 draw from the *whole* distribution the model learned:
+    hand them noise and they hand back some molecule. Neither takes an
+    instruction — and nearly every real use of a generative model is one. Make
+    it long and thin. Keep this ring and fill in the rest.
 
-    $$\hat\sigma_m = \tfrac{1}{2}\sqrt{\langle F^2 \rangle_m}
-      \qquad \text{(per-molecule } \mathrm{RMS}(F)/2\text{)}.$$
+    The obvious way there is to train for it, conditioning the network on
+    whatever you want to ask for. Both tasks below take the other route and
+    leave the trained model **exactly as it is**: the instruction enters in the
+    *sampler*. They share one recipe — every iteration, force the state onto
+    the constraint, then let the model repair whatever that broke. Because a
+    model call always follows the nudge, the repair is chemistry rather than
+    interpolation: what comes out satisfies the constraint *and* survives the
+    denoiser. The alternation is the whole trick; either half alone does not
+    work.
 
-    **Write a `DirectDenoisingSampler` subclass that paces itself by that
-    estimate instead.** Override `denoise`; per iteration:
+    Two kinds of constraint worth knowing, one each:
 
-    1. predict the pseudo force $F$ for the current structures;
-    2. estimate each molecule's noise level $\hat\sigma_m$ from $F$;
-    3. direct-denoise: $\hat x_0 = x + F/2$;
-    4. if $\max_m \hat\sigma_m \le \sigma_\text{min}$ (the schedule's own
-       floor, 0.05 Å): stop, return $\hat x_0$;
-    5. otherwise re-noise a *shrunken* amount onto the estimate,
-       $x \leftarrow \hat x_0 + \kappa\,\hat\sigma_m\,\varepsilon$ with
-       $\varepsilon \sim \mathcal N(0, I)$, $\kappa \approx 0.7$ — and go to 1.
+    | | the constraint | how it enters |
+    |---|---|---|
+    | **a** | a **global, continuous** property — the structure's shape | a linear map on the state, before every model call |
+    | **b** | **exact positions** for some atoms — a scaffold | a custom prior, plus rows the loop never updates |
 
-    No grid and no schedule: the model paces its own descent, and every
-    molecule descends at its own rate. Note what the class needs that the base
-    class does not: $\hat\sigma_m$ is *per molecule*, so the batch layout
-    (`idx_m`, `n_atoms`) has to be handed to the constructor — the
-    tensor-level core knows only an anonymous sample axis.
+    **How to work them.** Each task ships two cells: one holding a class for
+    you to fill in — it *runs* as shipped, it just doesn't steer anything yet —
+    and, under it, a cell that samples with whatever you wrote and plays the
+    result as a movie. So the loop is short: edit, re-run, watch the movie
+    change. Both classes subclass `DirectDenoisingSampler`, whose loop is four
+    lines and carries no schedule to stay consistent with, which makes it the
+    one to interfere with.
 
-    Useful pieces: `model_fn(x, None)`, `snn.scatter_add` for per-molecule
-    sums, `sampling_batch[properties.idx_m]` to broadcast per-molecule values
-    back to atoms.
-
-    ```python
-    class VarianceConditionedDenoising(DirectDenoisingSampler):
-        def __init__(self, process, parametrization, idx_m, n_atoms,
-                     shrink=0.7, sigma_stop=SIGMA_MIN, **kwargs):
-            super().__init__(process, parametrization, **kwargs)
-            ...
-
-        def denoise(self, model, x_t, n_steps, cond=None):
-            x = x_t
-            for _ in range(n_steps):
-                F = model(x, None, cond)   # 1. predict — no time input
-                sigma_hat = ...            # 2. per-molecule RMS(F) / 2
-                x0_hat = ...               # 3. direct denoising
-                if ...:                    # 4. converged?
-                    return x0_hat
-                x = ...                    # 5. shrink & re-noise
-            return x
-    ```
-
-    **Check your implementation against these questions:** how many model
-    calls does it take before it stops — and how does that compare with the two
-    fixed budgets above, 64 for the ladder and 60 for direct denoising? What
-    happens for $\kappa \to 1$ and for $\kappa \to 0$? Why is it fine that
-    molecules reach $\sigma_\text{min}$ at different iterations?
+    One thing is switched for you. §7's `USE_BIG_MODEL` decides what §7 samples
+    with; **these two tasks always use the research-scale model**, whatever
+    that switch says. You are steering a sampler here, and the effect of
+    steering is only legible when the model underneath is not the bottleneck —
+    the teaching-sized network of §6 would swamp both signals with its own
+    error.
     """)
     return
 
@@ -1174,98 +1179,420 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
-    SIGMA_MIN,
-    force_param,
-    model_fn,
-    plt,
-    process,
+    big_model,
+    fully_connected_batch,
+    make_model_fn,
+    numbers,
     properties,
-    sampling_batch,
-    snn,
-    torch,
-    viz,
+    to_device,
 ):
-    from schnetpack.generative import DirectDenoisingSampler as _DDS
+    # §7's layout again, ten molecules wide this time, and bound to the
+    # research-scale model whatever USE_BIG_MODEL says
+    task_batch = to_device(fully_connected_batch(numbers, n_mol=10), DEVICE)
+    task_model_fn = make_model_fn(big_model, task_batch, "pseudo_force_pred")
+    n_task = int(task_batch[properties.n_atoms].sum())
+    return n_task, task_batch, task_model_fn
 
-    class VarianceConditionedDenoising(_DDS):
-        """Direct denoising paced by the model's own per-molecule sigma estimate."""
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### a) Shape-guided direct denoising
+
+    **Shape** — rod, disc, ball — is a property of the atom cloud rather than
+    of its chemistry, and three numbers hold it. Center a structure and form
+    the 3×3 covariance of its positions,
+
+    $$C = \frac{1}{n}\sum_i x_i x_i^\top
+        = V \operatorname{diag}(\lambda_1 \ge \lambda_2 \ge \lambda_3) V^\top .$$
+
+    The eigenvectors are the **principal axes** and $\lambda_i$ the variance
+    along each. Their sum $\operatorname{tr} C$ is the mean squared distance
+    from the center — the structure's *size* — and the normalized triple
+    $r_i = \lambda_i / \operatorname{tr} C$ is its *shape*: unchanged by
+    rotation, and independent of size. Our 181 isomers run from
+    $r = (0.41, 0.33, 0.26)$, the roundest of them, to $(0.89, 0.09, 0.02)$,
+    the open chain §5 kept noising — and $r_3$ averages $0.03$ over the set,
+    which is these molecules saying they are flat.
+
+    **Make the sampler generate at a *prescribed* $r^\ast$.** Once per
+    iteration, before the model is called, stretch and squeeze the current
+    structure onto the target: eigendecompose its covariance, then scale along
+    each principal axis by
+
+    $$s_i = \sqrt{\frac{r_i^\ast \operatorname{tr} C}{\lambda_i}},
+      \qquad x \leftarrow V \operatorname{diag}(s)\, V^\top x,$$
+
+    and hand *that* to the model. Since $\sum_i r_i^\ast = 1$ the new variances
+    again sum to $\operatorname{tr} C$: the map **preserves the total** and
+    only moves variance between axes. That restriction is what keeps the task
+    well-posed. Total variance is fixed by bond lengths and atom count, neither
+    of which you are free to choose — a guidance that inflated it too would be
+    demanding a molecule whose bonds are 20% too long, and the next model call
+    would spend itself undoing the demand instead of following it.
+
+    Why before *every* call rather than once on the finished sample? Applied
+    once, this is not guidance but damage: every bond along the long axis
+    stretched by $s_1$, and the validity check will say so. Applied every
+    iteration, each squeeze is small and the denoising step right after repairs
+    it — toward a structure that is already leaning the way you asked. That
+    alternation is the general recipe: the model supplies *is a molecule*, the
+    map supplies *has this shape*, and the loop looks for something that is
+    both.
+
+    Two edits, both marked `TODO` in the cell below: write `reshape`, and put
+    it in the loop. As shipped it reshapes nothing, so the movie you get is
+    §7's unguided sampler — your job is to make that movie change. The panel
+    captions measure you: each reads out the $r_1$ its molecule actually
+    reached, next to the molecule it turned out to be.
+
+    **Check your implementation against these questions:** how close does the
+    achieved $r_1$ get to the target — and which target does the model fight
+    hardest? (Change `SHAPE_TARGET` to the disc and to the ball; hold all three
+    against the dataset's range above.) On the ball run, read the molecule
+    names: a planar ring cannot fill three dimensions, so what does the model
+    reach for instead? What happens if you drop the trace preservation and
+    scale the total variance by 1.5 as well — and at which point in the loop
+    does that show? And what do the names do if you reshape *only once*, on the
+    finished sample?
+    """)
+    return
+
+
+@app.cell
+def _(DirectDenoisingSampler, torch):
+    class ShapeGuidedDenoising(DirectDenoisingSampler):
+        """Direct denoising that re-shapes its state before every model call."""
 
         def __init__(
-            self,
-            process,
-            parametrization,
-            idx_m,
-            n_atoms,
-            shrink=0.7,
-            sigma_stop=SIGMA_MIN,
-            **kwargs,
+            self, process, parametrization, idx_m, n_atoms, target, **kwargs
         ):
             super().__init__(process, parametrization, **kwargs)
             self.idx_m = idx_m  # which molecule each row belongs to
-            self.n_atoms = n_atoms
-            self.shrink = shrink
-            self.sigma_stop = sigma_stop
-            self.frames, self.sigma_track = [], []  # for the movie below
+            self.n_mol = int(n_atoms.shape[0])
+            target = torch.as_tensor(target, dtype=torch.float32)
+            # normalized and descending, to line up with the sorted eigenvalues
+            self.target = (target / target.sum()).sort(descending=True).values
 
-        def sigma_hat(self, F):
-            """Per-molecule noise estimate RMS(F) / 2 — the variance conditioning."""
-            msq = snn.scatter_add(
-                (F**2).mean(-1), self.idx_m, dim_size=self.n_atoms.shape[0]
-            ) / self.n_atoms.to(F.dtype)
-            return msq.sqrt() / 2
+        def reshape(self, x):
+            """Scale each molecule along its own principal axes onto `target`."""
+            out = x.clone()
+            for m in range(self.n_mol):
+                rows = self.idx_m == m
+                pos = x[rows]
+                pos = pos - pos.mean(0)  # each molecule on its own center
+                # TODO ------------------------------------------------------
+                # Eigendecompose this molecule's 3x3 covariance
+                # (`torch.linalg.eigh` returns ascending eigenvalues and the
+                # matching axes as *columns*), build the per-axis factor s_i of
+                # the formula above, and write the rescaled positions back.
+                out[rows] = pos  # as shipped: no reshaping at all
+                # -----------------------------------------------------------
+            return out
 
         def denoise(self, model, x_t, n_steps, cond=None):
             x = x_t
-            self.frames, self.sigma_track = [x.clone()], []
-            for _ in range(n_steps):
-                F = model(x, None, cond)  # 1. predict — no time input
-                sigma_hat = self.sigma_hat(F)  # 2. how noisy does the model think it is?
-                self.sigma_track.append(sigma_hat.clone())
-                # 3. direct denoising — the pseudo force is the way home
-                x0_hat = self.parametrization.to_x0(self.process, F, x, None)
-                # 4. stop when even the noisiest molecule is (estimated) clean
-                if float(sigma_hat.max()) <= self.sigma_stop:
-                    self.frames.append(x0_hat.clone())
-                    return x0_hat
-                # 5. re-noise a shrunken amount onto the estimate
-                x = x0_hat + (self.shrink * sigma_hat)[self.idx_m].unsqueeze(
-                    -1
-                ) * torch.randn_like(x)
-                self.frames.append(x.clone())
+            t = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+            for k in range(1, n_steps + 1):
+                # the base class's decaying noise injection, unchanged
+                noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
+                if noise_scale > 0.0:
+                    x = x + noise_scale * torch.randn_like(x)
+                # TODO: one line — the state that goes into the model should be
+                # the reshaped one
+                x = self.parametrization.to_x0(
+                    self.process, model(x, t, cond), x, t
+                )
+            return x
+    return (ShapeGuidedDenoising,)
+
+
+@app.cell
+def _(
+    DEVICE,
+    ShapeGuidedDenoising,
+    force_param,
+    n_task,
+    process,
+    properties,
+    rdkit_verdict,
+    recording_model_fn,
+    task_batch,
+    task_model_fn,
+    torch,
+    viz,
+):
+    # rod. Also try the disc, (0.50, 0.45, 0.05), and the ball, (1/3, 1/3, 1/3)
+    SHAPE_TARGET = (0.85, 0.13, 0.02)
+
+    def principal_ratios(x, layout):
+        """Per molecule: the variance along each principal axis, normalized."""
+        rows = []
+        for m in range(int(layout[properties.n_atoms].shape[0])):
+            pos = x[layout[properties.idx_m] == m]
+            pos = pos - pos.mean(0)
+            lam = torch.linalg.eigvalsh(pos.T @ pos / len(pos))  # ascending
+            rows.append(lam.flip(0) / lam.sum())
+        return torch.stack(rows).cpu()
+
+    torch.manual_seed(7)
+    shaped = ShapeGuidedDenoising(
+        process,
+        force_param,
+        task_batch[properties.idx_m],
+        task_batch[properties.n_atoms],
+        SHAPE_TARGET,
+    )
+    shape_start = shaped.prior.sample(
+        (n_task, 3), device=DEVICE, context=task_batch
+    )
+    watched_shape, shape_frames = recording_model_fn(task_model_fn)
+    with torch.no_grad():
+        x_shaped = shaped.denoise(watched_shape, shape_start, n_steps=60)
+    shape_frames.append(x_shaped)
+
+    # every panel says what its molecule reached and what it became
+    shape_r = principal_ratios(x_shaped, task_batch)
+    shape_idx_m = task_batch[properties.idx_m]
+    shape_titles = [
+        f"r₁={float(shape_r[m][0]):.2f} · "
+        + (
+            rdkit_verdict(
+                task_batch[properties.Z][shape_idx_m == m],
+                x_shaped[shape_idx_m == m],
+            )[1]
+            or "—"
+        )
+        for m in range(len(shape_r))
+    ]
+    viz.show_trajectory(
+        shape_frames,
+        task_batch,
+        titles=shape_titles,
+        zoom=0.35,
+        cell_px=190,
+        frame_ms=120,
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### b) Scaffold-conditioned generation
+
+    Fix part of a molecule, generate the rest. This is the question generative
+    chemistry actually gets asked: the scaffold is the part that already works
+    — a ring that binds, a core a synthesis route exists for — and what is
+    wanted is everything around it.
+
+    Ours: **uracil**. C₄H₄N₂O₂ is uracil's formula, so the RNA base is one of
+    our 181 isomers (index 7) and its six-membered ring is a scaffold worth
+    keeping. Keep the ring — atoms 1, 2, 3, 4, 5, 7 (C, N, C, C, C, N) — and
+    generate the rest: the two carbonyl oxygens (0, 6) and the four hydrogens
+    (8–11). Half the molecule given, half to place. The next cell builds
+    exactly that, with the atom indices drawn on so you can check them, and
+    leaves you four things to work with: `scaffold_batch` (the layout, in
+    uracil's atom order), `scaffold_model_fn` (the model bound to it), `x_kept`
+    (the ring coordinates, repeated per copy) and `free_atoms` (the mask of
+    rows a sampler may touch).
+
+    Two axes carry the task, one each:
+
+    **The prior.** §5 named it as an axis it does not vary — vary it here.
+    `GaussianPrior` draws every atom from
+    $\mathcal{N}(0, \sigma_\text{max}^2)$; a **scaffold prior** draws only the
+    *free* rows that way and puts the kept atoms at their given coordinates.
+    That is a legal prior, and the library's rule says why: an endpoint may
+    depend on anything known before generation — composition, atom count,
+    which atoms are fixed and where — but never on the data values of the batch
+    it is generating. So `ScaffoldPrior` subclasses `Prior` and is handed to
+    the sampler as its `prior=` argument, exactly like the process and the
+    parametrization.
+
+    **The sampler.** A prior only decides where the run *starts*; the first
+    model call would move the ring like anything else. So freeze it: after
+    every update write the scaffold coordinates back, and keep the noise
+    injection off those rows too. The free atoms see a ring that never moves,
+    and get pulled into place around it.
+
+    Three `TODO`s, all in the cell after next. As shipped, the prior is an
+    ordinary Gaussian and nothing is frozen — so what you get is an
+    unconditional sample that ignores the ring, and the panels say **⚠ ring
+    moved**. Get all three right and that warning disappears: the ring stands
+    still through the whole movie while the oxygens and hydrogens fly in around
+    it.
+
+    **Check your implementation against these questions:** did it rebuild
+    uracil (`O=c1cc[nH]c(=O)[nH]1`)? Several completions will be *other*
+    molecules on the same ring — enols, tautomers — which is worth deciding
+    about: failure, or the point? Then the honest worry: this start is
+    **out of distribution**. The model was trained on structures where every
+    atom carries the *same* noise level, and here six atoms are exact while six
+    sit 30 Å out. Does that show — and does starting the free atoms at a
+    smaller `std` (3 Å, say) buy better completions, or only less diverse ones?
+    Finally, freeze less: keep only the two ring nitrogens. How much of a
+    molecule does this model need before it can finish it?
+    """)
+    return
+
+
+@app.cell
+def _(
+    AtomsLoader,
+    DEVICE,
+    big_model,
+    dataset,
+    fully_connected_batch,
+    make_model_fn,
+    properties,
+    to_device,
+    torch,
+    viz,
+):
+    URACIL_IDX = 7  # C4H4N2O2 is uracil's formula — the RNA base is in the set
+    RING = [1, 2, 3, 4, 5, 7]  # its six-membered ring, in this molecule's order
+    N_SCAFFOLD = 10  # completions to generate
+
+    uracil = next(iter(AtomsLoader(dataset, sampler=[URACIL_IDX])))
+    # the layout has to follow *this* molecule's atom order — the isomers share
+    # a composition, not an ordering
+    scaffold_batch = to_device(
+        fully_connected_batch(uracil[properties.Z].tolist(), n_mol=N_SCAFFOLD), DEVICE
+    )
+    scaffold_model_fn = make_model_fn(big_model, scaffold_batch, "pseudo_force_pred")
+
+    # the same ring in every copy, at the dataset's (centered) coordinates...
+    x_kept = uracil[properties.R].repeat(N_SCAFFOLD, 1).to(DEVICE)
+    # ...and the mask of rows a sampler is allowed to touch
+    kept = torch.zeros(int(uracil[properties.n_atoms]), dtype=torch.bool)
+    kept[RING] = True
+    free_atoms = (~kept).repeat(N_SCAFFOLD).to(DEVICE)
+
+    viz.show_batch(
+        uracil,
+        titles=["uracil — keep 1,2,3,4,5,7; generate 0,6 and 8–11"],
+        atom_index=True,
+        cell_px=300,
+        zoom=1.5,
+    )
+    return N_SCAFFOLD, free_atoms, scaffold_batch, scaffold_model_fn, x_kept
+
+
+@app.cell
+def _(DirectDenoisingSampler, torch):
+    from schnetpack.generative import GaussianPrior, Prior
+
+    class ScaffoldPrior(Prior):
+        """Noise on the free atoms, the given coordinates on the rest.
+
+        `gaussian` stays False, the base class default: half these rows are not
+        random at all, and that flag is what gates the library's Gaussian-only
+        closed forms. Nothing here needs them — direct denoising only ever asks
+        a prior for a starting state.
+        """
+
+        def __init__(self, x_scaffold, free, idx_m, std):
+            self.x_scaffold = x_scaffold
+            self.free = free[:, None]  # (n_atoms, 1), to broadcast over x, y, z
+            self.idx_m = idx_m
+            self.std = std
+
+        def sample(self, shape, dtype=None, device=None, context=None):
+            x = self.std * torch.randn(
+                *shape,
+                dtype=dtype or self.x_scaffold.dtype,
+                device=device or self.x_scaffold.device,
+            )
+            # the same zero-COM frame everything else lives in, per molecule
+            x = GaussianPrior.center(x, self.idx_m)
+            # TODO: the free rows start as noise, the scaffold rows start at
+            # the coordinates they are supposed to keep (`torch.where`)
             return x
 
-    def solution_view():
-        torch.manual_seed(6)
-        vcd = VarianceConditionedDenoising(
-            process,
-            force_param,
-            sampling_batch[properties.idx_m],
-            sampling_batch[properties.n_atoms],
-        )
-        x_start = vcd.prior.sample(
-            (int(sampling_batch[properties.n_atoms].sum()), 3),
-            device=DEVICE,
-            context=sampling_batch,
-        )
-        with torch.no_grad():
-            vcd.denoise(model_fn, x_start, n_steps=80)
+    class ScaffoldDenoising(DirectDenoisingSampler):
+        """Direct denoising in which the scaffold rows never move."""
 
-        fig, ax = plt.subplots(figsize=(5.5, 3.2))
-        ax.semilogy(torch.stack(vcd.sigma_track).cpu().numpy(), alpha=0.8)
-        ax.axhline(SIGMA_MIN, color="k", ls=":", lw=1)
-        ax.set_xlabel("iteration (= model calls)")
-        ax.set_ylabel(r"estimated $\hat\sigma_m$ [Å]")
-        ax.set_title(
-            f"self-paced descent: {len(vcd.sigma_track)} model calls, one line per molecule"
-        )
-        ax.grid(alpha=0.3, which="both")
-        # one animated box per molecule; the σ̂ story is the plot above
-        viewer = viz.show_trajectory(
-            vcd.frames, sampling_batch, zoom=0.35, cell_px=170
-        )
-        return fig, viewer
+        def __init__(self, process, parametrization, x_scaffold, free, **kwargs):
+            super().__init__(process, parametrization, **kwargs)
+            self.x_scaffold, self.free = x_scaffold, free[:, None]
 
-    viz.details("🔑 Reference solution — try it yourself first!", *solution_view())
+        def denoise(self, model, x_t, n_steps, cond=None):
+            x = x_t
+            t = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+            for k in range(1, n_steps + 1):
+                noise_scale = self.stochastic_lambda * (1.0 - k / n_steps)
+                if noise_scale > 0.0:
+                    # TODO: the scaffold does not move, not even by the injection
+                    x = x + noise_scale * torch.randn_like(x)
+                x0_hat = self.parametrization.to_x0(
+                    self.process, model(x, t, cond), x, t
+                )
+                # TODO: only the free rows take the update
+                x = x0_hat
+            return x
+    return ScaffoldDenoising, ScaffoldPrior
+
+
+@app.cell
+def _(
+    DEVICE,
+    N_SCAFFOLD,
+    SIGMA_MAX,
+    ScaffoldDenoising,
+    ScaffoldPrior,
+    force_param,
+    free_atoms,
+    process,
+    properties,
+    rdkit_verdict,
+    recording_model_fn,
+    scaffold_batch,
+    scaffold_model_fn,
+    torch,
+    viz,
+    x_kept,
+):
+    torch.manual_seed(11)
+    scaffolded = ScaffoldDenoising(
+        process,
+        force_param,
+        x_kept,
+        free_atoms,
+        prior=ScaffoldPrior(
+            x_kept, free_atoms, scaffold_batch[properties.idx_m], SIGMA_MAX
+        ),
+        stochastic_lambda=1.0,
+    )
+    watched_scaffold, scaffold_frames = recording_model_fn(scaffold_model_fn)
+    with torch.no_grad():
+        x_scaffold = scaffolded.sample(
+            watched_scaffold, shape=x_kept.shape, n_steps=60, device=DEVICE
+        )
+    scaffold_frames.append(x_scaffold)
+
+    # the ring has to come back bit-identical — that is what "frozen" means
+    ring_frozen = torch.equal(x_scaffold[~free_atoms], x_kept[~free_atoms])
+    scaffold_idx_m = scaffold_batch[properties.idx_m]
+    scaffold_titles = [
+        ("" if ring_frozen else "⚠ ring moved · ")
+        + (
+            rdkit_verdict(
+                scaffold_batch[properties.Z][scaffold_idx_m == m],
+                x_scaffold[scaffold_idx_m == m],
+            )[1]
+            or "—"
+        )
+        for m in range(N_SCAFFOLD)
+    ]
+    viz.show_trajectory(
+        scaffold_frames,
+        scaffold_batch,
+        titles=scaffold_titles,
+        zoom=0.35,
+        cell_px=190,
+        frame_ms=120,
+    )
     return
 
 
@@ -1274,10 +1601,10 @@ def _(mo):
     mo.md(r"""
     ## Where to go from here
 
-    Three things this tutorial skipped, all in the library. The two remaining
-    axes — the *coupling* and the *prior* — are constructor arguments exactly
-    like the process and the parametrization, and swapping them is how methods
-    like flow matching with optimal transport or shaped priors are built.
+    Three things this tutorial skipped, all in the library. Of the five axes
+    only the *coupling* is left untouched — how the $(x_0, x_1)$ pairs are
+    matched up, and the slot flow matching with optimal transport plugs into;
+    it is a constructor argument exactly like the prior §8b replaced.
     §7 assembled `Sampler` with one integrator and the default grid, and both
     slots hold more: `Euler` and `Heun` integrate the reverse SDE or the
     probability-flow ODE (`churn=0`) instead of stepping the exact posterior,

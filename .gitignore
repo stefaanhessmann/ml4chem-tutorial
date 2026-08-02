@@ -3,12 +3,16 @@
 data/*.db
 
 # Checkpoints are large and mostly experimental. Ship exactly the ones the
-# tutorial loads — adding another is one line here, deliberately. The §6
-# model is not among them: that cell trains it live, every run.
+# tutorial loads — adding another is one line here, deliberately.
 checkpoints/*
 # 20 MB, and what §7's USE_BIG_MODEL switches to for the research-scale
 # comparison. Converted from the GPFF QM9 run by convert_gpff_seed999.py.
 !checkpoints/gpff_big.pt
+# The §6 model, so that cell loads instead of costing every reader ~12
+# minutes; RETRAIN = True reproduces it. Carries its loss history, because
+# §6 plots the curve either way. Built by make_checkpoint.py in the
+# SchNetPack checkout's sandbox/gpff_notebook_loop/.
+!checkpoints/gpff.pt
 
 # Development scripts: they stay on disk, they do not go to students.
 convert_gpff_seed999.py
@@ -16,9 +20,18 @@ gpff_qm9.py
 sample_gpff_qm9.py
 sample_direct_gpff_qm9.py
 
+# The §8 answers. Same rule, sharper reason: the tasks ship as stubs with
+# TODOs, so shipping this beside them would be shipping the answer key.
+# Hand it out after the session.
+solutions.py
+
 # Superseded copies kept for reference.
 *.bak
 
 __pycache__/
 __marimo__/
 *.pyc
+
+# Instructor check for the section-8 tasks (runs solutions.py against the
+# shipped runner cells). Same rule: stays on disk.
+check_solutions.py

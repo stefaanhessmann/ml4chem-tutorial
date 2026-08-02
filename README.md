@@ -12,8 +12,10 @@ builds a generative model out of the same pieces a machine-learned force field
 is made of: noising structures and computing labels as a dataloader transform
 (`Diffuse`), a `NeuralNetworkPotential` with a per-atom vector head, a plain
 PyTorch training loop, and two samplers — direct denoising and ancestral
-sampling — to generate new structures. Ends with a hands-on task: a
-variance-conditioned direct-denoising sampler.
+sampling — to generate new structures. Ends with two hands-on tasks, both
+steering a sampler without retraining the model: shape-guided direct denoising
+(generate at a prescribed ratio of principal-axis variances) and
+scaffold-conditioned generation (keep uracil's ring, generate the rest).
 
 The model is **GPFF** (Gaussian pseudo-force field), whose target is a pseudo
 force — which makes it, structurally, an ordinary force field applied to noised
@@ -27,9 +29,11 @@ ML4Chem-tutorial/
 ├── data/
 │   └── qm9_c4h4n2o2.xyz   ← 181 QM9 isomers of C4H4N2O2, with U0 energies [eV]
 ├── checkpoints/
+│   ├── gpff.pt            ← the section-6 model (1.7M params, 12k steps on the 181
+│   │                        isomers) and its loss history. That cell loads it
+│   │                        unless you set RETRAIN = True
 │   └── gpff_big.pt        ← GPFF trained on all of QM9 (5.1M params); section 7's
-│                            USE_BIG_MODEL switch swaps it in for comparison.
-│                            The section-6 model is trained live, not shipped
+│                            USE_BIG_MODEL switch swaps it in for comparison
 ├── viz.py                 ← 3D trajectory viewer (3Dmol.js grid, shared slider,
 │                            optional per-atom vector arrows)
 ├── helpers.py             ← notebook glue: static sampling batches and the
@@ -97,7 +101,7 @@ to one exact build — firmer than a tag, which can be moved.
 
 Nothing else differs between the two. `viz.py` builds one self-contained page
 either way and only its last step branches on the frontend, so the viewers,
-the scrubber and §8's collapsible solution behave the same in both. The one
+the scrubber and §8's task movies behave the same in both. The one
 rule that branch enforces: every page is sealed in its own iframe, because the
 pages name their controls with fixed ids (`slider`, `grid`, `play`) and a
 Jupyter document renders every output into one shared DOM — two unsealed pages
