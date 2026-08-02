@@ -27,15 +27,14 @@ ML4Chem-tutorial/
 ├── data/
 │   └── qm9_c4h4n2o2.xyz   ← 181 QM9 isomers of C4H4N2O2, with U0 energies [eV]
 ├── checkpoints/
-│   ├── gpff.pt            ← the small GPFF section 6 trains (48k params, this dataset)
-│   └── gpff_big.pt        ← GPFF trained on all of QM9 (5.1M params); sections 7-8
-│                            sample with this — the small one cannot generate
+│   └── gpff_big.pt        ← GPFF trained on all of QM9 (5.1M params); section 7's
+│                            USE_BIG_MODEL switch swaps it in for comparison
 ├── viz.py                 ← 3D trajectory viewer (3Dmol.js grid, shared slider,
 │                            optional per-atom vector arrows)
 ├── helpers.py             ← notebook glue: static sampling batches and the
 │                            batch-dict → model(x, t) adapter
 ├── assets/3Dmol-min.js    ← vendored viewer library (offline, no CDN)
-├── make_checkpoints.py    ← regenerates gpff.pt (~20 min on CPU)
+├── make_checkpoints.py    ← builds gpff.pt offline (the notebook trains it live)
 └── make_colab.py          ← derives notebook.ipynb for Colab (see below)
 ```
 
@@ -62,16 +61,19 @@ marimo edit notebook.py     # interactive (recommended for the tutorial)
 marimo run notebook.py      # read-only app view
 ```
 
-The training cell loads the shipped `gpff.pt` by default; set `RETRAIN = True`
-there (or run `python make_checkpoints.py`) to train from scratch.
+No small checkpoint ships: the training cell trains it live (~4 min on a GPU,
+~40 on CPU), saves it, and reloads its own save on re-runs; `RETRAIN = True`
+forces a fresh run, and `python make_checkpoints.py` builds the same file
+offline.
 
-**Two models, deliberately.** Section 6 trains a teaching-sized network — small
-enough to train live, too small to generate: on this dataset it fuses atoms in
-most of its samples and passes the RDKit validity check essentially never.
-Sections 7-8 therefore load `gpff_big.pt`, the same GPFF target and process at
-research scale (5.1M parameters, all of QM9, σ_max = 30 Å), which samples clean
-geometry. It is not produced by `make_checkpoints.py`: it is converted from the
-GPFF QM9 training run by `convert_gpff_seed999.py` (a dev script, not shipped).
+**Two models, deliberately.** Section 6 trains a teaching-sized network with
+GPFF's recipe — linear VE process to σ_max = 30 Å, log-normal σ-focused
+timestep sampling — and sections 7-8 sample with it by default. For
+comparison, section 7's `USE_BIG_MODEL` switch swaps in `gpff_big.pt`: the
+same target, process and training density at research scale (5.1M parameters,
+all of QM9). It is not produced by `make_checkpoints.py`: it is converted from
+the GPFF QM9 training run by `convert_gpff_seed999.py` (a dev script, not
+shipped).
 
 ## Colab
 

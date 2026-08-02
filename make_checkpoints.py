@@ -1,8 +1,9 @@
 """Train the tutorial checkpoint from scratch.
 
 Produces ``checkpoints/gpff.pt`` — the time-free GPFF model that sections 5-6
-of the notebook define and train. The notebook loads it so nothing has to
-train; run this script to regenerate it.
+of the notebook define and train. No checkpoint ships: the notebook trains
+live by default and reloads its own save on re-runs; this script builds the
+same file offline.
 
 The architectures here MUST match the ones assembled in ``notebook.py`` —
 the checkpoints are plain ``state_dict``s.
@@ -23,7 +24,13 @@ from ase.io import read
 import schnetpack.nn as snn
 import schnetpack.transform as trn
 from schnetpack.data import ASEAtomsData, AtomsLoader
-from schnetpack.generative import VE, Diffuse, PseudoForceParametrization
+from schnetpack.generative import (
+    Diffuse,
+    GaussianPrior,
+    LogNormalSigmaTimes,
+    PseudoForceParametrization,
+    VELinear,
+)
 from schnetpack.model import (
     AtomwiseVector,
     NeuralNetworkPotential,
@@ -35,9 +42,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 XYZ = os.path.join(HERE, "data", "qm9_c4h4n2o2.xyz")
 DB = os.path.join(HERE, "data", "qm9_c4h4n2o2.db")
 
-SIGMA_MIN = 0.05
-SIGMA_MAX = 30.0  # matches the shipped generation model, so one process serves both
-CUTOFF = 30.0  # must cover the *noised* structures, not just the clean ones
+PRIOR_STD = 30.0  # matches the shipped generation model, so one process serves both
+CUTOFF = 150.0  # must cover the *noised* structures — clouds ~90 A across
 BATCH_SIZE = 10
 LEARNING_RATE = 5e-4
 N_STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
@@ -54,13 +60,19 @@ def build_db():
     )
 
 
-def make_loader(process, parametrization, label_key):
+def make_loader(process, parametrization, t_sampler, label_key):
     dataset = ASEAtomsData(
         DB,
         load_properties=[],
         transforms=[
             trn.SubtractCenterOfGeometry(),
-            Diffuse(process, parametrization, label_key=label_key, time_key="t"),
+            Diffuse(
+                process,
+                parametrization,
+                t_sampler=t_sampler,
+                label_key=label_key,
+                time_key="t",
+            ),
             trn.MatScipyNeighborList(cutoff=CUTOFF),
             trn.CastTo32(),
         ],
@@ -74,7 +86,7 @@ def gpff_network(output_key):
         representation=PaiNN(
             n_atom_basis=32,
             n_interactions=3,
-            radial_basis=snn.GaussianRBF(n_rbf=30, cutoff=CUTOFF),
+            radial_basis=snn.GaussianRBF(n_rbf=100, cutoff=CUTOFF),
             cutoff_fn=snn.CosineCutoff(CUTOFF),
         ),
         input_modules=[PairwiseDistances()],
@@ -113,8 +125,13 @@ def main():
 
     # --- GPFF ------------------------------------------------------------- #
     torch.manual_seed(0)
-    process = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    loader = make_loader(process, PseudoForceParametrization(), label_key="pseudo_force")
+    process = VELinear(
+        t_min=0.0, t_max=1.0, prior=GaussianPrior(std=PRIOR_STD, centered=False)
+    )
+    t_sampler = LogNormalSigmaTimes(process, mean=-0.7, std=1.2, truncate=True)
+    loader = make_loader(
+        process, PseudoForceParametrization(), t_sampler, label_key="pseudo_force"
+    )
     model = gpff_network("pseudo_force_pred")
 
     def gpff_loss(pred, batch):

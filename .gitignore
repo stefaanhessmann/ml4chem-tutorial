@@ -22,3 +22,6 @@ sample_direct_gpff_qm9.py
 __pycache__/
 __marimo__/
 *.pyc
+
+# trained live by the notebook (and by make_checkpoints.py); never ships
+checkpoints/gpff.pt
