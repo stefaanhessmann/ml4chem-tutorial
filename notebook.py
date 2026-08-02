@@ -188,21 +188,19 @@ def _(mo):
 @app.cell
 def _():
     import os
-
     import numpy as np
     import torch
     from ase.io import read
-
     from schnetpack.data import ASEAtomsData, AtomsLoader
-
-    # Everything downstream follows this one line: the GPU when this machine
-    # (or this Colab runtime) has one, the CPU otherwise.
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
     XYZ_FILE = os.path.join(HERE, "data", "qm9_c4h4n2o2.xyz")
     DB_PATH = os.path.join(HERE, "data", "qm9_c4h4n2o2.db")
+    # Everything downstream follows this one line: the GPU when this machine
+    # (or this Colab runtime) has one, the CPU otherwise.
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # the tutorial's data: one xyz of isomers, read once and put into a db
     molecules = read(XYZ_FILE, index=":")  # a list of ase.Atoms
     numbers = molecules[0].get_atomic_numbers().tolist()  # every isomer: same composition
 
@@ -354,14 +352,14 @@ def _(mo):
 def _(AtomsLoader, batch, dataset, properties, torch, viz):
     from schnetpack.generative import VE, VP
 
-    # the process every later section shares
     SIGMA_MIN, SIGMA_MAX = 0.05, 30.0  # as the §7 generation model was trained
-    process = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
-
     CHAIN_IDX = 90  # the most elongated open-chain isomer of the dataset
     chain = next(iter(AtomsLoader(dataset, sampler=[CHAIN_IDX])))
     x0 = chain[properties.R]  # the structure every illustration below noises
+
+    # the VE process every later section shares
+    ve = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
+    vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
 
     # a trajectory is just interpolate() evaluated along a grid of times
     torch.manual_seed(3)
@@ -369,7 +367,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
     z_noise = torch.randn_like(x0)  # shared draw: only its scale differs
     frames_vp = [vp.interpolate(x0, vp.prior.std * z_noise, t) for t in t_noise]
     frames_ve = [
-        process.interpolate(x0, process.prior.std * z_noise, t) for t in t_noise
+        ve.interpolate(x0, ve.prior.std * z_noise, t) for t in t_noise
     ]
 
     # ghost_id=0: the clean chain stays faintly in place behind xₜ
@@ -382,7 +380,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
         ghost_id=0,
         panel_labels=("x₀ (data)", "xₜ", "x₁ (prior)"),
     )
-    return SIGMA_MAX, chain, process, x0
+    return SIGMA_MAX, chain, ve, x0
 
 
 @app.cell
@@ -422,7 +420,7 @@ def _(mo):
 
 
 @app.cell
-def _(chain, process, torch, viz, x0):
+def _(chain, ve, torch, viz, x0):
     from schnetpack.generative import (
         EpsParametrization,
         PseudoForceParametrization,
@@ -437,13 +435,13 @@ def _(chain, process, torch, viz, x0):
     # whichever field the network is asked to predict
     torch.manual_seed(3)
     t_param = torch.linspace(1.0, 0.2, 13)
-    x1_param = process.prior.sample_like(x0)
+    x1_param = ve.prior.sample_like(x0)
     ts_param = [torch.full((len(x0),), float(ti)) for ti in t_param]
-    frames_param = [process.interpolate(x0, x1_param, t) for t in ts_param]
+    frames_param = [ve.interpolate(x0, x1_param, t) for t in ts_param]
     targets = {
         # the pseudo force is drawn at half length: F/2 = x0 - x_t is the
         # offset itself, so each arrow lands exactly on the clean structure
-        name: [scale * p.target(process, x0, x1_param, t) for t in ts_param]
+        name: [scale * p.target(ve, x0, x1_param, t) for t in ts_param]
         for name, p, scale in (
             ("eps target", eps_param, 1.0),
             ("score target", score_param, 1.0),
@@ -507,14 +505,14 @@ def _(mo):
 
 
 @app.cell
-def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
+def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, ve, trn):
     from schnetpack.generative import Diffuse, LogNormalSigmaTimes
 
     CUTOFF = 150.0  # must cover *noised* structures: clouds ~90 Å across
 
+    # the forward process, wrapped into the dataset's transform pipeline:
     # train mostly around half an Ångström of displacement, GPFF's density
-    t_sampler = LogNormalSigmaTimes(process, mean=-0.7, std=1.2, truncate=True)
-
+    t_sampler = LogNormalSigmaTimes(ve, mean=-0.7, std=1.2, truncate=True)
     diffused = ASEAtomsData(
         DB_PATH,
         load_properties=[],
@@ -522,7 +520,7 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
             trn.SubtractCenterOfGeometry(),
             # the same schedule the frames above walked, sampled where it helps
             Diffuse(
-                process,
+                ve,
                 force_param,
                 t_sampler=t_sampler,
                 label_key="pseudo_force",
@@ -558,9 +556,9 @@ def _(mo):
 
 
 @app.cell
-def _(peek, process, properties, viz):
+def _(peek, ve, properties, viz):
     # one box per structure of the batch, captioned with its own noise level
-    sigma_peek = process.sigma(peek["t_structure"])
+    sigma_peek = ve.sigma(peek["t_structure"])
     viz.show_trajectory(
         [peek[properties.R]],
         peek,
@@ -625,6 +623,8 @@ def _(CUTOFF, DEVICE, torch):
     )
 
     torch.manual_seed(0)
+
+    # the denoiser: an ordinary MLFF, read out as a vector per atom
     gpff_net = NeuralNetworkPotential(
         representation=PaiNN(
             n_atom_basis=128,
@@ -695,21 +695,21 @@ def _(mo):
 
 
 @app.cell
-def _(AtomsLoader, DEVICE, HERE, diffused, gpff_net, os, process, torch):
+def _(AtomsLoader, DEVICE, HERE, diffused, gpff_net, os, ve, torch):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
-
     from helpers import to_device
 
     CKPT = os.path.join(HERE, "checkpoints", "gpff.pt")
     RETRAIN = False  # True: run the loop below instead of loading the checkpoint
 
+    # the training run itself, from its hyperparameters down
     STEPS, BATCH, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
 
     def gpff_loss(pred, inputs):
         # 1/sigma^2 undoes the label's sigma-scaling; the ceiling keeps the
         # small-sigma end (where bonds are decided) from being flattened away
-        weight = (1.0 / process.sigma(inputs["t"]) ** 2).clamp(max=100.0)
+        weight = (1.0 / ve.sigma(inputs["t"]) ** 2).clamp(max=100.0)
         diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
         return (weight[:, None] * diff**2).mean()
 
@@ -912,7 +912,7 @@ def _(
     force_param,
     gen_model,
     numbers,
-    process,
+    ve,
     properties,
     to_device,
     torch,
@@ -923,8 +923,8 @@ def _(
     from schnetpack.generative.integrators import Ancestral
 
     N_LADDER = 64
-
     torch.manual_seed(2)
+
     # 8 molecules-to-be, laid out where the model lives
     sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
     model_fn = make_model_fn(gen_model, sampling_batch, "pseudo_force_pred")
@@ -932,7 +932,7 @@ def _(
 
     # process + parametrization as before, plus the two sampling-only parts;
     # `grid` is left at its default (uniform in t = geometric in sigma on VE)
-    ancestral = Sampler(process, force_param, integrator=Ancestral())
+    ancestral = Sampler(ve, force_param, integrator=Ancestral())
 
     # the sampler returns the final structure only; wrapping the model keeps
     # every state it was asked about, which is the trajectory
@@ -1015,7 +1015,7 @@ def _(
     force_param,
     model_fn,
     n_total,
-    process,
+    ve,
     recording_model_fn,
     sampling_batch,
     torch,
@@ -1024,7 +1024,7 @@ def _(
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
-    direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=1.0)
+    direct = DirectDenoisingSampler(ve, force_param, stochastic_lambda=1.0)
 
     # draw the start from the prior (a 30 Å cloud per molecule), then run
     # the denoising loop
@@ -1399,7 +1399,7 @@ def _(
     ShapeGuidedDenoising,
     force_param,
     n_task,
-    process,
+    ve,
     properties,
     recording_model_fn,
     smiles_per_molecule,
@@ -1413,7 +1413,7 @@ def _(
 
     torch.manual_seed(7)
     shaped = SAMPLER(
-        process,
+        ve,
         force_param,
         task_batch[properties.idx_m],
         task_batch[properties.n_atoms],
@@ -1685,7 +1685,7 @@ def _(
     ScaffoldPrior,
     force_param,
     free_atoms,
-    process,
+    ve,
     properties,
     recording_model_fn,
     scaffold_batch,
@@ -1700,7 +1700,7 @@ def _(
 
     torch.manual_seed(11)
     scaffolded = SAMPLER_B(
-        process,
+        ve,
         force_param,
         x_kept,
         free_atoms,
