@@ -67,8 +67,8 @@ def _(mo):
     **Hardware.** The first code cell sets `DEVICE` to a GPU when one is
     available and to the CPU otherwise; the model and every batch follow it,
     and nothing below is device-specific. The GPU matters in exactly one
-    place — §6's training run, a couple of minutes there against ~15 on a
-    CPU; everything else is comfortable either way.
+    place — §6's training run, a few minutes there against the better part of
+    an hour on a CPU; everything else is comfortable either way.
     """)
     return
 
@@ -436,6 +436,15 @@ def _(mo):
 
     An ordinary MSE against `"pseudo_force"` is then the whole training
     objective — no special training loop anywhere.
+
+    One practical note for §6. `Diffuse` runs *per structure*, in a dataloader
+    worker, which is the right place for it when the structures are many and
+    large. Ours are neither — 181 molecules of 12 atoms — and at that size the
+    preprocessing costs several times more per step than the model does. So
+    §6 keeps the same two library calls (`process.perturb`, then the
+    parametrization's `target`) but makes them on the GPU, on structures that
+    stay resident there. Same noising, same labels, same objective; roughly
+    five times the training steps per minute.
     """)
     return
 
@@ -466,12 +475,11 @@ def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, process, trn):
             trn.CastTo32(),
         ],
     )
-    train_loader = AtomsLoader(diffused, batch_size=100, shuffle=True)
-    # a second, smaller draw from the same pipeline — only so the picture below
-    # stays a picture; a hundred viewers on one page is not one
+    # a small draw from the pipeline — only so the picture below stays a
+    # picture; a hundred viewers on one page is not one
     peek = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
     {key: tuple(peek[key].shape) for key in ("_positions", "pseudo_force", "t")}
-    return CUTOFF, peek, train_loader
+    return CUTOFF, peek, t_sampler
 
 
 @app.cell
@@ -539,7 +547,15 @@ def _(mo):
        in `Atomwise` instead: a scalar per atom, summed per molecule.)
 
     The cutoff is 150 Å because this force field sees *noised* structures — a
-    fully noised cloud is ~90 Å across.
+    fully noised cloud is ~90 Å across. That number then decides a second one.
+    A `GaussianRBF` spreads its basis functions evenly over the cutoff, so 100
+    of them across 150 Å put one every 1.5 Å — wider than a bond, which leaves
+    a 1.0 Å contact and a 1.4 Å bond with 98% identical embeddings, and a
+    denoiser that cannot tell a clash from a bond will happily generate both.
+    600 puts one every 0.25 Å. `norm_epsilon=1` is the other concession to
+    noised inputs: PaiNN normalizes each pair direction as
+    $r_{ij}/(d_{ij} + 1)$ rather than $r_{ij}/d_{ij}$, which stays finite when
+    two atoms of a noise cloud land on top of each other.
     """)
     return
 
@@ -557,14 +573,15 @@ def _(CUTOFF, DEVICE, torch):
     torch.manual_seed(0)
     gpff_net = NeuralNetworkPotential(
         representation=PaiNN(
-            n_atom_basis=32,
-            n_interactions=3,
-            radial_basis=snn.GaussianRBF(n_rbf=100, cutoff=CUTOFF),
+            n_atom_basis=128,
+            n_interactions=4,
+            radial_basis=snn.GaussianRBF(n_rbf=600, cutoff=CUTOFF),
             cutoff_fn=snn.CosineCutoff(CUTOFF),
+            norm_epsilon=1.0,  # dir_ij = r_ij / (d_ij + 1): smooth at d → 0
         ),
         input_modules=[PairwiseDistances()],
         output_modules=[
-            AtomwiseVector(n_in=32, n_layers=1, output_key="pseudo_force_pred")
+            AtomwiseVector(n_in=128, n_layers=3, output_key="pseudo_force_pred")
         ],
     ).to(DEVICE)
     f"GPFF model: {sum(p.numel() for p in gpff_net.parameters()):,} parameters on {DEVICE}"
@@ -583,80 +600,129 @@ def _(mo):
     mo.md(r"""
     ### Training
 
-    Model and data augmentation meet in an ordinary PyTorch loop: fetch a
-    batch from the §5 loader, compare the model's prediction against the
-    `"pseudo_force"` label, step the optimizer. The only diffusion-specific
-    line is the **loss weight** $\min(1/\sigma(t)^2, 1)$: it undoes the
-    label's $\sigma$-scaling so the heavily-noised samples don't drown out the
-    nearly-clean ones.
+    Model and data augmentation meet in an ordinary PyTorch loop: draw a
+    minibatch of molecules, noise them, compare the model's prediction against
+    the pseudo-force label, step the optimizer. The three diffusion-specific
+    lines are the ones §5 already introduced — `t_sampler`, `process.perturb`,
+    `force_param.target` — run here rather than in the dataloader.
 
-    One thing to appreciate about the loop's shape: every pass over
-    `train_loader` re-runs the transforms, so **every epoch sees fresh
-    $(t, \text{noise})$ draws** — the dataset is effectively infinite. If you
-    cache the batches instead (e.g. `itertools.cycle(train_loader)`), the
-    noise freezes and the model memorizes a fixed set of noised structures
-    rather than learning the denoising field.
+    The one line worth arguing about is the **loss weight**
+    $\min(1/\sigma(t)^2, w_\text{max})$. The $1/\sigma^2$ undoes the label's
+    $\sigma$-scaling, so that what is being minimized is the *relative* error
+    at every noise level rather than the absolute one; without it the deep-noise
+    samples, whose labels are tens of Ångström long, drown out everything else.
+    The ceiling then decides how much of the small-$\sigma$ end survives, and
+    it is easy to set too low: at $w_\text{max} = 1$ it binds for 71% of the
+    draws, which flattens the weight back to "every sample counts the same"
+    across the whole band where bond lengths are decided. At 100 the weight is
+    the honest $1/\sigma^2$ almost everywhere.
 
-    No checkpoint for this one — the cell below *is* the training run: a
-    couple of minutes on a GPU against ~15 on a CPU, the one place in this
-    notebook the hardware genuinely matters. Re-running the cell trains again
-    from scratch. Don't over-read the loss curve: it plateaus well above zero
-    because every noise level keeps an irreducible error — that is healthy.
+    Two things about the loop's shape. **Every step sees fresh
+    $(t, \text{noise})$ draws** — the dataset is effectively infinite, and a
+    model that saw a fixed set of noised structures would memorize them
+    instead of learning the denoising field. And the weights that get used
+    downstream are an **exponential moving average** of the ones the optimizer
+    visited: a few thousand steps is a noisy place to stop, and the averaged
+    model samples visibly better than whichever iterate happened to be last.
+
+    No checkpoint for this one — the cell below *is* the training run: a few
+    minutes on a GPU and the better part of an hour on a CPU, the one place in
+    this notebook the hardware genuinely matters. Re-running the cell trains
+    again from scratch. Don't over-read the loss curve: it plateaus well above
+    zero because every noise level keeps an irreducible error — that is
+    healthy.
     """)
     return
 
 
 @app.cell
-def _(DEVICE, gpff_net, process, torch, train_loader):
+def _(
+    AtomsLoader,
+    DEVICE,
+    dataset,
+    force_param,
+    gpff_net,
+    process,
+    properties,
+    t_sampler,
+    torch,
+):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
 
-    from helpers import to_device
+    from helpers import fully_connected_batch, to_device
 
-    EPOCHS, LR_START, LR_END = 200, 5e-4, 1e-5
+    STEPS, N_MOL, LR_START, LR_END, EMA_DECAY = 12000, 64, 1e-3, 1e-5, 0.999
 
-    def gpff_loss(pred, inputs):
-        # 1/sigma^2 undoes the label's sigma-scaling; the clamp keeps
-        # nearly-clean samples from dominating
-        weight = (1.0 / process.sigma(inputs["t"]) ** 2).clamp(max=1.0)
-        diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
-        return (weight[:, None] * diff**2).mean()
+    # the whole clean dataset, centered by §3's transform, kept on the GPU
+    clean = to_device(next(iter(AtomsLoader(dataset, batch_size=len(dataset)))), DEVICE)
+    n_at = int(clean[properties.n_atoms][0])
+    x0_all = clean[properties.R].reshape(-1, n_at, 3)
+    # the isomers share a composition but not an atom *order* — 101 orderings
+    # across the 181 — so Z is gathered along with the positions. The pair
+    # list is not: fully connected is the same block-diagonal layout whatever
+    # the elements are, and stays valid at every noise level.
+    z_all = clean[properties.Z].reshape(-1, n_at)
+    layout = to_device(fully_connected_batch([1] * n_at, n_mol=N_MOL), DEVICE)
+    idx_m = layout[properties.idx_m]
+
+    def gpff_loss(pred, label, t):
+        # 1/sigma^2 undoes the label's sigma-scaling; the ceiling keeps the
+        # small-sigma end — where bonds are decided — from being flattened away
+        weight = (1.0 / process.sigma(t) ** 2).clamp(max=100.0)
+        return (weight[:, None] * (pred - label) ** 2).mean()
 
     optimizer = torch.optim.Adam(gpff_net.parameters(), lr=LR_START)
     # decay the step size geometrically from LR_START to LR_END across the
-    # run — one factor per epoch, so the last epochs only polish
+    # run — so the last steps only polish
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=(LR_END / LR_START) ** (1 / EPOCHS)
+        optimizer, gamma=(LR_END / LR_START) ** (1 / STEPS)
     )
-    history, step = [], 0
-    # the bar counts epochs; its postfix is that epoch's mean loss, the same
-    # number the curve below plots
-    epochs = tqdm(range(EPOCHS), desc="epoch", unit="ep")
-    for epoch in epochs:
-        running = 0.0
-        for train_batch in train_loader:  # fresh (t, noise) draws every epoch
-            step += 1
-            train_batch = to_device(train_batch, DEVICE)  # transforms ran on CPU
-            loss = gpff_loss(gpff_net(train_batch), train_batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            running += loss.item()
-            history.append((step, loss.item()))
-        scheduler.step()
-        epochs.set_postfix(
-            loss=f"{running / len(train_loader):.4f}",
-            lr=f"{scheduler.get_last_lr()[0]:.1e}",
+    # the running average of the weights, which is what samples at the end
+    ema = {key: v.detach().clone().float() for key, v in gpff_net.state_dict().items()}
+
+    history = []
+    steps = tqdm(range(STEPS), desc="step", unit="it")
+    for step in steps:
+        # fresh molecules, fresh times, fresh noise — §5's three calls, here
+        pick = torch.randint(len(x0_all), (N_MOL,), device=DEVICE)
+        t = t_sampler(N_MOL, DEVICE).to(x0_all.dtype)[idx_m]  # one time per molecule
+        x_t, x0_clean, x1_noise, t_atoms, eps = process.perturb(
+            x0_all[pick].reshape(-1, 3), t=t, context=layout
         )
 
+        train_batch = dict(layout)
+        train_batch[properties.Z] = z_all[pick].reshape(-1)
+        train_batch[properties.R] = x_t
+        loss = gpff_loss(
+            gpff_net(train_batch)["pseudo_force_pred"],
+            force_param.target(process, x0_clean, x1_noise, t_atoms, eps),
+            t_atoms,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        with torch.no_grad():
+            for key, value in gpff_net.state_dict().items():
+                ema[key].mul_(EMA_DECAY).add_(value.float(), alpha=1.0 - EMA_DECAY)
+
+        history.append((step, loss.item()))
+        if step % 50 == 0:
+            steps.set_postfix(
+                loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.1e}"
+            )
+
+    gpff_net.load_state_dict({key: v.to(DEVICE) for key, v in ema.items()})
     gpff_model = gpff_net.eval()  # downstream cells use the *trained* model
 
     loss_fig, loss_ax = plt.subplots(figsize=(6, 3))
-    loss_ax.plot(*zip(*history), lw=1.2)
+    loss_ax.plot(*zip(*history), lw=0.7, alpha=0.8)
+    loss_ax.set_yscale("log")
     loss_ax.set_xlabel("step")
     loss_ax.set_ylabel("weighted pseudo-force MSE")
     loss_ax.grid(alpha=0.3)
-    return gpff_model, plt, to_device
+    return fully_connected_batch, gpff_model, plt, to_device
 
 
 @app.cell
@@ -671,15 +737,17 @@ def _(mo):
     Denoising has to be accurate exactly where geometry is decided, at
     $\sigma \lesssim 0.3$ Å where bond lengths live — which is precisely
     where the time sampler concentrated its training. How well that worked is
-    what the validation cells below measure; don't expect perfection from
-    four minutes of training.
+    what the validation cells below measure; don't expect perfection from a
+    few minutes of training on 181 molecules. Roughly half of what it draws is
+    a chemically valid molecule, and essentially all of it is sane geometry —
+    which, for a model this size, is the honest answer.
 
     For comparison the bundle also ships `checkpoints/gpff_big.pt`: a GPFF
     trained the same way — same pseudo-force target, same VE process, same
     $\sigma$-focused time sampling — but at research scale: **5.1M
     parameters, trained on all ~130k molecules of QM9**. The assembly below is
-    the same `NeuralNetworkPotential` of §6 — same process, same cutoff — with
-    bigger numbers in it, and
+    the same `NeuralNetworkPotential` of §6 — same process, same cutoff, same
+    radial basis — with
     `USE_BIG_MODEL` swaps it into every sampling and validation cell that
     follows. Flip it after one pass through §7: how far the numbers move is
     the most honest measure of what scale buys.
@@ -797,6 +865,7 @@ def _(mo):
 def _(
     DEVICE,
     force_param,
+    fully_connected_batch,
     gen_model,
     numbers,
     process,
@@ -805,7 +874,7 @@ def _(
     torch,
     viz,
 ):
-    from helpers import fully_connected_batch, make_model_fn, recording_model_fn
+    from helpers import make_model_fn, recording_model_fn
     from schnetpack.generative import Sampler
     from schnetpack.generative.integrators import Ancestral
 
@@ -866,17 +935,26 @@ def _(mo):
     That loop is `DirectDenoisingSampler`. At iteration $k$ of $N$ it injects
     $\lambda\,(1 - k/N)$ of noise before the model call, decaying to zero. It
     never asks what noise level its iterate sits at, which is only possible
-    because the model doesn't either. Here $\lambda = 0$: the plain repeated
-    jump, no injection at all — the deterministic end of the knob, where
-    diversity comes from the starting draw alone. (Raise it and the loop puts
-    noise back between jumps, which buys diversity at the price of needing
-    the schedule to decay it.)
+    because the model doesn't either.
+
+    $\lambda$ deserves a moment, because $\lambda = 0$ — the plain repeated
+    jump, no injection at all — looks like the natural choice and is the wrong
+    one. With nothing put back the loop is a deterministic fixed-point
+    iteration, and it converges to whatever the model's map happens to
+    attract: for a live-trained model that means atoms stranded off the
+    structure, and occasionally a run that leaves the finite numbers behind
+    altogether. The injection keeps the iterate inside the band the model was
+    trained on, and the decay walks it down from there. Here $\lambda = 1$,
+    and on the validation counts below it is the difference between a third of
+    the samples passing and nearly all of them.
 
     Compare the two samplers on cost. The ladder above took **64** model
-    calls; this loop takes **15** — schedule-based sampling is the more
-    expensive of the two, which is precisely the pressure that produced
-    methods like GPFF's. Both are `schnetpack.generative` one-liners over the
-    same trained model, so swapping them is a one-line experiment.
+    calls; this loop takes **60**. They are close here because this model is
+    small and wants the iterations — the loop's budget is a dial rather than a
+    schedule, and a stronger model gets away with far fewer (flip
+    `USE_BIG_MODEL` and 15 is plenty). Both are `schnetpack.generative`
+    one-liners over the same trained model, so swapping them is a one-line
+    experiment.
 
     Watch the difference in the movie. Where the ladder descended gradually
     and only revealed a structure near the bottom, direct denoising is at
@@ -902,7 +980,7 @@ def _(
     from schnetpack.generative import DirectDenoisingSampler
 
     torch.manual_seed(2)
-    direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=0.0)
+    direct = DirectDenoisingSampler(process, force_param, stochastic_lambda=1.0)
 
     # draw the start from the prior — a 30 Å cloud per molecule — then run
     # the denoising loop
@@ -910,10 +988,12 @@ def _(
 
     watched_fn, direct_frames = _rec(model_fn)
     with torch.no_grad():
-        x_direct = direct.denoise(watched_fn, x_init, n_steps=15)
+        x_direct = direct.denoise(watched_fn, x_init, n_steps=60)
     direct_frames.append(x_direct)  # ...plus the structure it ended on
 
-    viz.show_trajectory(direct_frames, sampling_batch, zoom=0.35, cell_px=170)
+    viz.show_trajectory(
+        direct_frames, sampling_batch, zoom=0.35, cell_px=170, frame_ms=120
+    )
     return (x_direct,)
 
 
@@ -1048,10 +1128,10 @@ def _(mo):
 
     `DirectDenoisingSampler` runs a *prescribed* number of iterations, and
     what noise it puts back — $\lambda(1 - k/N)$ — is decided before the run
-    and identical for every molecule in the batch. Above we set $\lambda = 0$
-    and put back nothing at all, which leaves the loop with no notion of how
-    far along it is. But a GPFF model reveals the noise level in its own
-    prediction:
+    and identical for every molecule in the batch: the same 60 iterations and
+    the same decay whether a structure is already nearly clean or still a
+    cloud. The loop has no notion of how far along any of them is. But a GPFF
+    model reveals the noise level in its own prediction:
 
     $$\hat\sigma_m = \tfrac{1}{2}\sqrt{\langle F^2 \rangle_m}
       \qquad \text{(per-molecule } \mathrm{RMS}(F)/2\text{)}.$$
@@ -1099,7 +1179,7 @@ def _(mo):
 
     **Check your implementation against these questions:** how many model
     calls does it take before it stops — and how does that compare with the two
-    fixed budgets above, 64 for the ladder and 15 for direct denoising? What
+    fixed budgets above, 64 for the ladder and 60 for direct denoising? What
     happens for $\kappa \to 1$ and for $\kappa \to 0$? Why is it fine that
     molecules reach $\sigma_\text{min}$ at different iterations?
     """)
