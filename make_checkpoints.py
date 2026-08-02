@@ -1,9 +1,8 @@
 """Train the tutorial checkpoint from scratch.
 
-Produces ``checkpoints/gpff.pt`` — the time-free GPFF model with
-perturbation-alignment coupling that sections 5-8 of the notebook define,
-train and sample. The notebook loads it so sampling works instantly; run this
-script to regenerate it.
+Produces ``checkpoints/gpff.pt`` — the time-free GPFF model that sections 5-6
+of the notebook define and train. The notebook loads it so nothing has to
+train; run this script to regenerate it.
 
 The architectures here MUST match the ones assembled in ``notebook.py`` —
 the checkpoints are plain ``state_dict``s.
@@ -24,12 +23,7 @@ from ase.io import read
 import schnetpack.nn as snn
 import schnetpack.transform as trn
 from schnetpack.data import ASEAtomsData, AtomsLoader
-from schnetpack.generative import (
-    VE,
-    Diffuse,
-    PermutationCoupling,
-    PseudoForceParametrization,
-)
+from schnetpack.generative import VE, Diffuse, PseudoForceParametrization
 from schnetpack.model import (
     AtomwiseVector,
     NeuralNetworkPotential,
@@ -42,7 +36,7 @@ XYZ = os.path.join(HERE, "data", "qm9_c4h4n2o2.xyz")
 DB = os.path.join(HERE, "data", "qm9_c4h4n2o2.db")
 
 SIGMA_MIN = 0.05
-SIGMA_MAX = 10.0  # ~ largest pairwise distance in the dataset (7.7 A) + margin
+SIGMA_MAX = 30.0  # matches the shipped generation model, so one process serves both
 CUTOFF = 30.0  # must cover the *noised* structures, not just the clean ones
 BATCH_SIZE = 10
 LEARNING_RATE = 5e-4
@@ -117,9 +111,9 @@ def main():
     build_db()
     os.makedirs(os.path.join(HERE, "checkpoints"), exist_ok=True)
 
-    # --- GPFF with perturbation-alignment coupling ------------------------- #
+    # --- GPFF ------------------------------------------------------------- #
     torch.manual_seed(0)
-    process = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, coupling=PermutationCoupling())
+    process = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     loader = make_loader(process, PseudoForceParametrization(), label_key="pseudo_force")
     model = gpff_network("pseudo_force_pred")
 

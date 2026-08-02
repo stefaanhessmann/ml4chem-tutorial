@@ -43,7 +43,7 @@ def _(mo):
     │   └── qm9_c4h4n2o2.xyz   ← the dataset: 181 small molecules from QM9
     ├── checkpoints/
     │   ├── gpff.pt            ← the small model §6 trains — ships, so nothing has to train
-    │   └── gpff_big.pt        ← a GPFF trained on all of QM9; §7-8 generate with this one
+    │   └── gpff_big.pt        ← a GPFF trained on all of QM9; §7-8 generate with this one by default
     ├── helpers.py             ← small glue code (batch adapters for sampling)
     ├── viz.py                 ← 3D molecule viewer
     └── assets/3Dmol-min.js    ← vendored viewer library (works offline)
@@ -265,15 +265,18 @@ def _(mo):
       ($a \equiv 1$); noise whose scale grows geometrically from
       $\sigma_\text{min}$ to $\sigma_\text{max}$ is *added* until it drowns
       the structure. $\sigma_\text{max}$ must match the data scale — rule of
-      thumb: the largest pairwise distance, ~7.7 Å here. Too small and the
-      endpoint still remembers the data; too large and training wastes
-      capacity — and *neither failure is loud*.
+      thumb: at least the largest pairwise distance, ~7.7 Å here. Too small and
+      the endpoint still remembers the data; too large and training wastes
+      capacity — and *neither failure is loud*. We take **30 Å** — deliberately
+      generous, because it is what the ready-trained generation model of §7
+      uses, and staying on one process keeps every model in this notebook
+      interchangeable.
 
     For all illustrations we use a single molecule: an elongated, open-chain
     isomer whose shape is easy to track through the noise. Below, that chain
     under both processes with the same underlying noise draw (slider = $t$):
     VP shrinks it into a small fixed-size cloud, VE leaves it in place and
-    buries it under a 10 Å one.
+    buries it under a 30 Å one.
     """)
     return
 
@@ -282,7 +285,7 @@ def _(mo):
 def _(AtomsLoader, batch, dataset, properties, torch, viz):
     from schnetpack.generative import VE, VP
 
-    SIGMA_MIN, SIGMA_MAX = 0.05, 10.0  # ≈ largest pairwise distance + margin
+    SIGMA_MIN, SIGMA_MAX = 0.05, 30.0  # σ_max as the §7 generation model was trained
     ve = VE(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     vp = VP(scale=float(batch[properties.R].std()))  # VP wants the data scale
 
@@ -307,7 +310,7 @@ def _(AtomsLoader, batch, dataset, properties, torch, viz):
         ghost_id=0,
         panel_labels=("x₀ (data)", "xₜ", "x₁ (prior)"),
     )
-    return SIGMA_MAX, SIGMA_MIN, VE, chain, ve, x0
+    return SIGMA_MIN, chain, ve, x0
 
 
 @app.cell
@@ -399,7 +402,8 @@ def _(mo):
     2. `Diffuse` — overwrites `R` with $x_t$, writes the label
        `"pseudo_force"` and the time `"t"`;
     3. `MatScipyNeighborList` — **after** noising, with a cutoff sized for
-       *noised* structures (30 Å, not 10);
+       *noised* structures (30 Å — several times the ~7 Å the clean molecules
+       span);
     4. `CastTo32`.
 
     An ordinary MSE against `"pseudo_force"` is then the whole training
@@ -409,34 +413,18 @@ def _(mo):
 
 
 @app.cell
-def _(
-    ASEAtomsData,
-    AtomsLoader,
-    DB_PATH,
-    SIGMA_MAX,
-    SIGMA_MIN,
-    VE,
-    force_param,
-    trn,
-):
-    from schnetpack.generative import Diffuse, PermutationCoupling
+def _(ASEAtomsData, AtomsLoader, DB_PATH, force_param, trn, ve):
+    from schnetpack.generative import Diffuse
 
     CUTOFF = 30.0  # must cover *noised* structures, not just clean ones
-
-    # the same VE schedule as above, plus a coupling: it re-pairs atoms and
-    # noise draws (nearest gets nearest), which shortens the paths the model
-    # must learn. One of the two axes we skip — passed along silently because
-    # the shipped checkpoint was trained with it.
-    gpff_process = VE(
-        sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, coupling=PermutationCoupling()
-    )
 
     diffused = ASEAtomsData(
         DB_PATH,
         load_properties=[],
         transforms=[
             trn.SubtractCenterOfGeometry(),
-            Diffuse(gpff_process, force_param, label_key="pseudo_force", time_key="t"),
+            # the same VE schedule the frames above walked
+            Diffuse(ve, force_param, label_key="pseudo_force", time_key="t"),
             trn.MatScipyNeighborList(cutoff=CUTOFF),
             trn.CastTo32(),
         ],
@@ -446,7 +434,7 @@ def _(
     # stays a picture; a hundred viewers on one page is not one
     peek = next(iter(AtomsLoader(diffused, batch_size=10, shuffle=True)))
     {key: tuple(peek[key].shape) for key in ("_positions", "pseudo_force", "t")}
-    return CUTOFF, gpff_process, peek, train_loader
+    return CUTOFF, peek, train_loader
 
 
 @app.cell
@@ -467,9 +455,9 @@ def _(mo):
 
 
 @app.cell
-def _(gpff_process, peek, properties, viz):
+def _(peek, properties, ve, viz):
     # one box per structure of the batch, captioned with its own noise level
-    sigma_peek = gpff_process.sigma(peek["t_structure"])
+    sigma_peek = ve.sigma(peek["t_structure"])
     viz.show_trajectory(
         [peek[properties.R]],
         peek,
@@ -579,7 +567,7 @@ def _(mo):
 
 
 @app.cell
-def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
+def _(DEVICE, HERE, gpff_net, os, torch, train_loader, ve):
     import matplotlib.pyplot as plt
     from tqdm.auto import tqdm
 
@@ -591,7 +579,7 @@ def _(DEVICE, HERE, gpff_net, gpff_process, os, torch, train_loader):
     def gpff_loss(pred, inputs):
         # 1/sigma^2 undoes the label's sigma-scaling; the clamp keeps
         # nearly-clean samples from dominating
-        weight = (1.0 / gpff_process.sigma(inputs["t"]) ** 2).clamp(max=1.0)
+        weight = (1.0 / ve.sigma(inputs["t"]) ** 2).clamp(max=1.0)
         diff = pred["pseudo_force_pred"] - inputs["pseudo_force"]
         return (weight[:, None] * diff**2).mean()
 
@@ -656,17 +644,21 @@ def _(mo):
     numbers below: essentially none of its samples survive the chemistry check.
 
     So sampling switches models. `checkpoints/gpff_big.pt` is a GPFF trained the
-    same way — same pseudo-force target, same VE process — but at research
-    scale: **5.1M parameters, trained on all ~130k molecules of QM9**. Nothing
-    conceptual changes, and the assembly below is the same
-    `NeuralNetworkPotential` of §6 with bigger numbers in it. Two settings do
-    differ, and both are properties of *that* training run rather than choices
-    we are free to make here: it was trained at $\sigma_\text{max} = 30$ Å
-    (against our 10), so it needs its own `VE`, and its cutoff is 150 Å.
+    same way — same pseudo-force target, same VE process with the same
+    $\sigma_\text{max} = 30$ Å — but at research scale: **5.1M parameters,
+    trained on all ~130k molecules of QM9**. Nothing conceptual changes, and
+    the assembly below is the same `NeuralNetworkPotential` of §6 with bigger
+    numbers in it. One setting does differ, a property of *that* training run
+    rather than a choice we are free to make here: its cutoff is 150 Å
+    (against our 30), sized so even fully noised structures stay in view.
 
-    Everything from here on — both samplers and your task in §8 — runs on this
-    model. If you want to see what your own §6 model does instead, one name
-    changes: `make_model_fn(gpff_model, ...)` below.
+    Everything from here on — both samplers and your task in §8 — runs on
+    whichever model `USE_BIG_MODEL` below selects. It defaults to the shipped
+    generation model; flip it to `False` to sample with the model you trained
+    in §6 instead — same process, same samplers, only the network swapped.
+    Worth doing once you have read through §7: watching the validation numbers
+    collapse under the small model is the most honest measure of what scale
+    buys.
     """)
     return
 
@@ -679,12 +671,11 @@ def _(
     NeuralNetworkPotential,
     PaiNN,
     PairwiseDistances,
-    VE,
     os,
     snn,
     torch,
 ):
-    BIG_CUTOFF, BIG_SIGMA_MAX, BIG_SIGMA_MIN = 150.0, 30.0, 0.01
+    BIG_CUTOFF = 150.0
 
     big_net = NeuralNetworkPotential(
         representation=PaiNN(
@@ -708,12 +699,18 @@ def _(
     )
     big_model = big_net.eval()
 
-    # its own process: this model was trained at sigma_max = 30 A, so the §5
-    # schedule (10 A) is not the one its predictions are calibrated against
-    big_process = VE(sigma_min=BIG_SIGMA_MIN, sigma_max=BIG_SIGMA_MAX)
+    f"generation model: {sum(p.numel() for p in big_net.parameters()):,} parameters on {DEVICE}"
+    return (big_model,)
 
-    f"generation model: {sum(p.numel() for p in big_net.parameters()):,} parameters on {DEVICE}, σ_max = {BIG_SIGMA_MAX:g} Å"
-    return big_model, big_process
+
+@app.cell
+def _(big_model, gpff_model):
+    USE_BIG_MODEL = True  # False: sample with the model you trained in §6
+
+    # the model that generates from here on; both were trained against the
+    # same process, so nothing else changes with it
+    gen_model = big_model if USE_BIG_MODEL else gpff_model
+    return (gen_model,)
 
 
 @app.cell
@@ -761,13 +758,13 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
-    big_model,
-    big_process,
     force_param,
+    gen_model,
     numbers,
     properties,
     to_device,
     torch,
+    ve,
     viz,
 ):
     from helpers import fully_connected_batch, make_model_fn, recording_model_fn
@@ -776,9 +773,9 @@ def _(
     torch.manual_seed(2)
     # 8 molecules-to-be, laid out where the model lives
     sampling_batch = to_device(fully_connected_batch(numbers, n_mol=8), DEVICE)
-    model_fn = make_model_fn(big_model, sampling_batch, "pseudo_force_pred")
+    model_fn = make_model_fn(gen_model, sampling_batch, "pseudo_force_pred")
 
-    direct = DirectDenoisingSampler(big_process, force_param, stochastic_lambda=1.0)
+    direct = DirectDenoisingSampler(ve, force_param, stochastic_lambda=1.0)
 
     # draw the start with the batch layout as context — each molecule's cloud
     # centered on its own — then run the denoising loop
@@ -815,7 +812,7 @@ def _(mo):
 
     | part | what it decides | here |
     |---|---|---|
-    | `process` | the noise schedule $\sigma(t)$ | the model's `VE` |
+    | `process` | the noise schedule $\sigma(t)$ | the `VE` of §5 |
     | `parametrization` | what the network's output means | pseudo force |
     | `integrator` | how one step down the ladder is taken | `Ancestral` |
     | `grid` | where the rungs sit | uniform in $t$ (the default) |
@@ -848,13 +845,13 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
-    big_process,
     force_param,
     model_fn,
     n_total,
     properties,
     sampling_batch,
     torch,
+    ve,
     viz,
 ):
     from helpers import recording_model_fn as _rec
@@ -866,7 +863,7 @@ def _(
     torch.manual_seed(2)
     # process + parametrization as before, plus the two sampling-only parts;
     # `grid` is left at its default (uniform in t = geometric in sigma on VE)
-    ancestral = Sampler(big_process, force_param, integrator=Ancestral())
+    ancestral = Sampler(ve, force_param, integrator=Ancestral())
 
     watched_anc, ancestral_frames = _rec(model_fn)
     with torch.no_grad():
@@ -910,8 +907,8 @@ def _(mo):
     Both samplers are scored, against the dataset row. Being able to say *how
     many* is the point: that number is what tells you whether a change to the
     model, the process or the sampler actually helped — and it is what says the
-    §6-sized model was not up to this, since it fuses atoms in most of its
-    samples where the generation model fuses none.
+    §6-sized model was not up to this, since it fuses atoms where the
+    generation model fuses none.
     """)
     return
 
@@ -1086,7 +1083,6 @@ def _(mo):
 def _(
     DEVICE,
     SIGMA_MIN,
-    big_process,
     force_param,
     model_fn,
     plt,
@@ -1094,6 +1090,7 @@ def _(
     sampling_batch,
     snn,
     torch,
+    ve,
     viz,
 ):
     from schnetpack.generative import DirectDenoisingSampler as _DDS
@@ -1148,7 +1145,7 @@ def _(
     def solution_view():
         torch.manual_seed(6)
         vcd = VarianceConditionedDenoising(
-            big_process,
+            ve,
             force_param,
             sampling_batch[properties.idx_m],
             sampling_batch[properties.n_atoms],
