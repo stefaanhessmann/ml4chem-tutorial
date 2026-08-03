@@ -1,10 +1,9 @@
 """Small local helpers for the ML4Chem tutorial notebook.
 
 Everything computational comes from ``schnetpack``; this module only holds the
-glue between the library and the notebook: building the static batch layout
-that sampling runs on, and adapting a SchNetPack batch-dict model to the
-sampler's tensor-level ``model(x, t, cond)`` contract. Rendering lives in
-``viz``.
+glue between the library and the notebook: adapting a SchNetPack batch-dict
+model to the sampler's tensor-level ``model(x, t, cond)`` contract. Rendering
+lives in ``viz``.
 """
 
 import torch
@@ -12,7 +11,6 @@ import torch
 from schnetpack import properties
 
 __all__ = [
-    "fully_connected_batch",
     "make_model_fn",
     "recording_model_fn",
     "to_device",
@@ -29,29 +27,6 @@ def to_device(batch, device):
     return {
         key: value.to(device) if torch.is_tensor(value) else value
         for key, value in batch.items()
-    }
-
-
-def fully_connected_batch(numbers, n_mol):
-    """A static batch layout for sampling: ``n_mol`` copies of one
-    composition, each molecule internally fully connected.
-
-    During sampling the atoms move at every step, but with a large cutoff
-    the neighbor list never needs rebuilding: the cutoff function already
-    downweights pairs by distance, and atoms of different molecules are
-    simply never connected (block-diagonal pair indices).
-    """
-    n_at = len(numbers)
-    i, j = torch.meshgrid(torch.arange(n_at), torch.arange(n_at), indexing="ij")
-    mask = i != j
-    offsets = torch.arange(n_mol).repeat_interleave(int(mask.sum())) * n_at
-    return {
-        properties.Z: torch.tensor(numbers).repeat(n_mol),
-        properties.idx_i: i[mask].repeat(n_mol) + offsets,
-        properties.idx_j: j[mask].repeat(n_mol) + offsets,
-        properties.offsets: torch.zeros(int(mask.sum()) * n_mol, 3),
-        properties.idx_m: torch.arange(n_mol).repeat_interleave(n_at),
-        properties.n_atoms: torch.full((n_mol,), n_at),
     }
 
 
@@ -75,7 +50,7 @@ def recording_model_fn(model_fn):
     frames along the way are not its to return. They do not have to be: every
     step passes its current state through the model, so wrapping the *model*
     records the trajectory without the sampler knowing. That is why this works
-    for any of them, the one you write in section 8 included.
+    for any of them, the one you write in section 5 included.
 
     Returns ``(wrapped, frames)``. ``frames`` fills as sampling runs and ends
     one short — the last state the model saw is not the last state of the run —

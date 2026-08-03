@@ -35,3 +35,6 @@ check_solutions.py
 # Locally executed copy with outputs baked in (~6 MB); notebook.ipynb stays
 # the clean generated file.
 notebook.executed.ipynb
+
+# Jupyter scratch from opening the executed copy.
+.ipynb_checkpoints/
